@@ -18,7 +18,9 @@ PACKET_SIZE = 1200     # 每个UDP包的数据负载大小 (字节)
 FEC_GROUP_SIZE = 10
 
 # --- 音频流参数 ---
-AUDIO_CHUNK = 1024      # 每次读取的音频数据大小 (样本数)
+# 减小CHUNK大小可以降低捕获延迟，但会增加计算量。
+# 比如512 / 16000Hz = 32ms 的捕获延迟。
+AUDIO_CHUNK = 256      # 每次读取的音频数据大小 (样本数)
 AUDIO_FORMAT = 8        # paInt16, 16位音频
 AUDIO_CHANNELS = 1      # 单声道
 AUDIO_RATE = 16000      # 采样率 (Hz)
