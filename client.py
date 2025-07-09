@@ -49,8 +49,8 @@ class NetworkMonitor:
             self.lost_packets = 0
             return {"loss_rate": loss_rate}
 
-# --- 2. 帧重组与抖动缓冲 ---
-class JitterBuffer:
+# --- 2. 帧重组与视频抖动缓冲 ---
+class VideoJitterBuffer:
     """
     一个更完善的帧缓冲和重组器。
     - 缓存乱序到达的数据包。
@@ -162,9 +162,6 @@ class JitterBuffer:
             if not self.ready_queue:
                 return None
 
-            # 决定是否播放下一帧
-            # 简单的策略：如果队列中有帧，就播放最老的那一帧
-            # 更优的策略可以考虑帧的时间戳和缓冲延迟
             frame_id, frame_data = self.ready_queue.popleft()
             self.last_played_frame_id = frame_id
             return frame_data
@@ -175,10 +172,28 @@ class JitterBuffer:
             cutoff_time = time.time() - 3 # 清理3秒前的旧缓冲区
             old_frame_ids = [fid for fid, buf in self.packet_buffers.items() if buf["timestamp"] < cutoff_time]
             for fid in old_frame_ids:
-                print(f"[Cleanup] 清理过时的帧缓冲: {fid}")
                 del self.packet_buffers[fid]
 
-# --- 3. 媒体处理线程 ---
+# --- 3. 音频抖动缓冲 ---
+class AudioJitterBuffer:
+    """
+    一个简单的音频抖动缓冲，用于平滑音频播放并降低延迟。
+    """
+    def __init__(self, max_size=5): # 缓冲最多5个音频包
+        self.queue = deque(maxlen=max_size)
+        self.lock = threading.Lock()
+
+    def add_chunk(self, chunk):
+        with self.lock:
+            self.queue.append(chunk)
+
+    def get_chunk(self):
+        with self.lock:
+            if not self.queue:
+                return None
+            return self.queue.popleft()
+
+# --- 4. 媒体处理线程 ---
 def video_receiver_thread(sock, jitter_buffer, monitor, running_flag):
     """接收视频数据包的线程"""
     while running_flag['running']:
@@ -189,39 +204,51 @@ def video_receiver_thread(sock, jitter_buffer, monitor, running_flag):
             print("[Video] 套接字错误，接收线程退出。")
             break
 
-def audio_player_thread(sock, running_flag):
-    """接收并播放音频数据的线程"""
+def audio_receiver_thread(sock, audio_buffer, running_flag):
+    """接收音频包并放入抖动缓冲"""
+    while running_flag['running']:
+        try:
+            data, _ = sock.recvfrom(AUDIO_CHUNK * 2)
+            audio_buffer.add_chunk(data)
+        except socket.error:
+            print("[Audio] 套接字错误，音频接收线程退出。")
+            break
+
+def audio_player_thread(audio_buffer, running_flag):
+    """从抖动缓冲中获取并播放音频数据的线程"""
     p = pyaudio.PyAudio()
     try:
         audio_stream = p.open(format=AUDIO_FORMAT,
                               channels=AUDIO_CHANNELS,
                               rate=AUDIO_RATE,
                               output=True,
-                              frames_per_buffer=AUDIO_CHUNK)
+                              frames_per_buffer=AUDIO_CHUNK) # 关键：设置与服务器匹配的块大小
     except Exception as e:
         print(f"[Audio] 无法打开音频播放设备: {e}")
         return
 
     print("[Audio] 音频播放已准备就绪。")
     while running_flag['running']:
-        try:
-            data, _ = sock.recvfrom(AUDIO_CHUNK * 2) # 缓冲区稍大一些
-            audio_stream.write(data)
-        except socket.error:
-            print("[Audio] 套接字错误，音频播放线程退出。")
-            break
-        except IOError as e:
-            print(f"[Audio] 播放音频时出错: {e}")
+        chunk = audio_buffer.get_chunk()
+        if chunk:
+            try:
+                audio_stream.write(chunk)
+            except IOError as e:
+                print(f"[Audio] 播放音频时出错: {e}")
+        else:
+            time.sleep(0.01) # 缓冲为空时短暂等待
 
     audio_stream.stop_stream()
     audio_stream.close()
     p.terminate()
     print("[Audio] 音频播放已停止。")
 
-def display_thread(jitter_buffer, running_flag):
+def display_thread(video_jitter_buffer, running_flag):
     """显示视频帧的线程"""
+    # 创建一个可调整大小的窗口，以便视频可以自适应窗口大小
+    cv2.namedWindow("Video Stream", cv2.WINDOW_NORMAL)
     while running_flag['running']:
-        frame_data = jitter_buffer.get_frame()
+        frame_data = video_jitter_buffer.get_frame()
         if frame_data:
             try:
                 nparr = np.frombuffer(frame_data, np.uint8)
@@ -236,7 +263,7 @@ def display_thread(jitter_buffer, running_flag):
             break
     cv2.destroyAllWindows()
 
-# --- 4. 控制信令发送 ---
+# --- 5. 控制信令发送 ---
 def feedback_sender_thread(sock, server_addr, monitor, running_flag):
     """定期向服务器发送网络状态反馈的线程"""
     while running_flag['running']:
@@ -247,7 +274,7 @@ def feedback_sender_thread(sock, server_addr, monitor, running_flag):
         except socket.error as e:
             print(f"[Feedback] 发送反馈失败: {e}")
 
-# --- 5. 主函数 ---
+# --- 6. 主函数 ---
 def main():
     # 提示用户输入服务器IP
     server_ip = input("请输入服务器的IP地址 (例如 192.168.1.100): ")
@@ -255,28 +282,34 @@ def main():
 
     # 初始化套接字
     video_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    video_sock.bind(('', VIDEO_PORT)) # 绑定到所有接口的视频端口
+    video_sock.bind(('', VIDEO_PORT))
     audio_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    audio_sock.bind(('', AUDIO_PORT)) # 绑定到音频端口
+    audio_sock.bind(('', AUDIO_PORT))
     control_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     # 初始化核心组件
     monitor = NetworkMonitor()
-    jitter_buffer = JitterBuffer(buffer_time_ms=150) # 150ms的抖动缓冲
+    video_jitter_buffer = VideoJitterBuffer(buffer_time_ms=150)
+    audio_jitter_buffer = AudioJitterBuffer(max_size=5)
     running_flag = {'running': True}
 
     # 启动视频接收线程
-    recv_thread = threading.Thread(target=video_receiver_thread, args=(video_sock, jitter_buffer, monitor, running_flag))
-    recv_thread.daemon = True
-    recv_thread.start()
+    video_recv_thread = threading.Thread(target=video_receiver_thread, args=(video_sock, video_jitter_buffer, monitor, running_flag))
+    video_recv_thread.daemon = True
+    video_recv_thread.start()
+
+    # 启动音频接收线程
+    audio_recv_thread = threading.Thread(target=audio_receiver_thread, args=(audio_sock, audio_jitter_buffer, running_flag))
+    audio_recv_thread.daemon = True
+    audio_recv_thread.start()
 
     # 启动音频播放线程
-    audio_thread = threading.Thread(target=audio_player_thread, args=(audio_sock, running_flag))
-    audio_thread.daemon = True
-    audio_thread.start()
+    audio_play_thread = threading.Thread(target=audio_player_thread, args=(audio_jitter_buffer, running_flag))
+    audio_play_thread.daemon = True
+    audio_play_thread.start()
 
     # 启动视频显示线程
-    disp_thread = threading.Thread(target=display_thread, args=(jitter_buffer, running_flag))
+    disp_thread = threading.Thread(target=display_thread, args=(video_jitter_buffer, running_flag))
     disp_thread.start()
 
     # 启动网络反馈发送线程
@@ -285,19 +318,17 @@ def main():
     
     # 启动缓冲区清理线程
     cleanup_thread = threading.Thread(target=lambda: (
-        time.sleep(5), jitter_buffer.cleanup()
+        time.sleep(5), video_jitter_buffer.cleanup()
     ), daemon=True)
     cleanup_thread.start()
 
     print("客户端已启动。正在连接到服务器...")
-    # 发送一个初始包来“注册”到服务器
     control_sock.sendto(json.dumps({"status": "connect"}).encode(), server_address)
-    feedback_thread.start() # 在发送第一个包后启动反馈
+    feedback_thread.start()
 
     print("连接成功。音视频流应在几秒钟内开始。")
     print("在视频窗口按 'q' 键退出。")
 
-    # 等待显示线程结束 (当用户按'q'时)
     disp_thread.join()
     
     print("正在关闭客户端...")
@@ -305,9 +336,10 @@ def main():
     video_sock.close()
     audio_sock.close()
     control_sock.close()
-    # 等待其他线程优雅退出
-    recv_thread.join(timeout=1)
-    audio_thread.join(timeout=1)
+    
+    video_recv_thread.join(timeout=1)
+    audio_recv_thread.join(timeout=1)
+    audio_play_thread.join(timeout=1)
     feedback_thread.join(timeout=1)
 
 if __name__ == "__main__":
