@@ -268,50 +268,69 @@ def audio_player_thread(audio_buffer, running_flag):
     print("[Audio] 音频播放已停止。")
 
 
-def display_thread(video_jitter_buffer, running_flag, status_ref, video_label, root):
+def display_thread(video_jitter_buffer, running_flag, status_ref, video_label, root, scaling_mode, target_size):
     """
-    显示视频帧的线程，现在更新 Tkinter 标签。
+    显示视频帧的线程。
+    - 使用事件驱动的尺寸更新，解决“渐进式”缩放问题。
+    - 使用最快的OpenCV插值算法，确保低延迟。
     """
+    last_frame_time = time.time()
+    WAIT_THRESHOLD = 1.0
 
     def update_frame():
+        nonlocal last_frame_time
         if not running_flag['running']:
             return
 
         frame_data = video_jitter_buffer.get_frame()
 
         if frame_data:
+            last_frame_time = time.time()
             try:
                 nparr = np.frombuffer(frame_data, np.uint8)
                 frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                 if frame is not None:
-                    # 将OpenCV BGR图像转换为RGB
+                    # --- 高性能视频缩放逻辑 (使用OpenCV) ---
+                    mode = scaling_mode.get()
+                    # 使用<Configure>事件更新的尺寸，避免在循环中频繁调用winfo_*
+                    label_w = target_size['w']
+                    label_h = target_size['h']
+
+                    if label_w > 1 and label_h > 1:
+                        if mode == "fill":
+                            # 模式1: 拉伸填充 - 使用最快的cv2.INTER_NEAREST插值算法
+                            frame = cv2.resize(frame, (label_w, label_h), interpolation=cv2.INTER_NEAREST)
+                        elif mode == "fit":
+                            # 模式2: 按比例缩放 - 使用最快的cv2.INTER_NEAREST插值算法
+                            h, w, _ = frame.shape
+                            ratio = min(label_w / w, label_h / h)
+                            new_size = (int(w * ratio), int(h * ratio))
+                            frame = cv2.resize(frame, new_size, interpolation=cv2.INTER_NEAREST)
+                        # 模式3: "original" - 无需操作
+
+                    # 转换到Tkinter格式
                     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     img = Image.fromarray(frame_rgb)
-
-                    # 调整图像大小以适应标签 (如果需要，可以根据标签实际大小调整)
-                    # 例如: img.thumbnail((video_label.winfo_width(), video_label.winfo_height()), Image.LANCZOS)
-
                     img_tk = ImageTk.PhotoImage(image=img)
+
                     video_label.config(image=img_tk)
-                    video_label.image = img_tk  # 保持引用，防止被垃圾回收
+                    video_label.image = img_tk
                     status_ref['video_active'] = True
-                    status_label.config(text="状态: 正在接收视频流...", fg="green")
+                    if "正在接收" not in status_label.cget("text"):
+                        status_label.config(text="状态: 正在接收视频流...", fg="green")
                 else:
-                    status_ref['video_active'] = False
-                    status_label.config(text="状态: 解码失败或无视频数据", fg="red")
+                    if time.time() - last_frame_time > WAIT_THRESHOLD:
+                        status_label.config(text="状态: 解码失败", fg="red")
             except Exception as e:
                 print(f"[Display] 解码或显示帧时出错: {e}")
-                status_ref['video_active'] = False
-                status_label.config(text="状态: 显示错误", fg="red")
         else:
-            status_ref['video_active'] = False
-            status_label.config(text="状态: 等待视频流...", fg="orange")
+            if time.time() - last_frame_time > WAIT_THRESHOLD:
+                status_ref['video_active'] = False
+                status_label.config(text="状态: 等待视频流...", fg="orange")
 
-        # 调度下一次更新
-        root.after(10, update_frame)  # 每10毫秒更新一次
+        root.after(15, update_frame)
 
-    # 启动第一次更新
-    root.after(10, update_frame)
+    root.after(15, update_frame)
 
 
 # --- 5. 控制信令发送 ---
@@ -339,11 +358,35 @@ def main():
     video_label = tk.Label(root, bg="#000000", bd=2, relief="sunken")
     video_label.pack(pady=10, padx=10, fill="both", expand=True)
 
+    # --- 事件驱动的尺寸更新 ---
+    # 创建一个字典来存储视频标签的尺寸，由<Configure>事件更新
+    # 这可以避免在渲染循环中反复调用winfo_width/height，并解决“渐进式”缩放问题
+    target_size = {'w': 0, 'h': 0}
+    def on_resize(event):
+        # 当窗口大小改变时，更新目标尺寸
+        target_size['w'] = event.width
+        target_size['h'] = event.height
+    video_label.bind("<Configure>", on_resize) # 绑定尺寸变更事件
+
     # 初始占位符图像
     placeholder_img = Image.new('RGB', (640, 480), color='gray')
     placeholder_tk = ImageTk.PhotoImage(image=placeholder_img)
     video_label.config(image=placeholder_tk)
-    video_label.image = placeholder_tk  # 保持引用
+    video_label.image = placeholder_tk
+
+    # --- 视频缩放选项 ---
+    scaling_mode = tk.StringVar(value="fit") # 默认是按比例缩放
+    
+    # 创建右键菜单
+    context_menu = tk.Menu(root, tearoff=0)
+    context_menu.add_radiobutton(label="自适应缩放 (保持宽高比)", variable=scaling_mode, value="fit")
+    context_menu.add_radiobutton(label="拉伸填充 (忽略宽高比)", variable=scaling_mode, value="fill")
+    context_menu.add_radiobutton(label="原始大小", variable=scaling_mode, value="original")
+
+    def show_context_menu(event):
+        context_menu.post(event.x_root, event.y_root)
+
+    video_label.bind("<Button-3>", show_context_menu) # 绑定右键点击事件
 
     # IP 输入框和连接按钮
     input_frame = tk.Frame(root, bg="#2c3e50")
@@ -430,7 +473,7 @@ def main():
         audio_play_thread.start()
 
         # 启动视频显示线程 (现在由 Tkinter 的 after 方法驱动)
-        display_thread(video_jitter_buffer, running_flag, status_ref, video_label, root)
+        display_thread(video_jitter_buffer, running_flag, status_ref, video_label, root, scaling_mode, target_size)
 
         # 启动网络反馈发送线程
         feedback_thread = threading.Thread(target=feedback_sender_thread,
