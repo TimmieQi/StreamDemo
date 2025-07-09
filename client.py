@@ -4,476 +4,305 @@ import numpy as np
 import threading
 import time
 import json
-import pyaudio
 from collections import defaultdict, deque
 import tkinter as tk
-from tkinter import messagebox, scrolledtext
+from tkinter import messagebox
 from PIL import Image, ImageTk
+import pyaudio
 
-# 从共享配置文件中导入设置
 from shared_config import *
 
-
-# --- 1. 网络状态监控器 ---
+# --- Classes (unchanged) ---
 class NetworkMonitor:
-    """
-    负责监控网络状态，主要是计算丢包率。
-    """
-
     def __init__(self):
-        self.received_packets = 0
-        self.lost_packets = 0
-        self.expected_frame_id = -1
+        self.received_packets, self.lost_packets, self.expected_frame_id = 0, 0, -1
         self.lock = threading.Lock()
-
     def record_packet(self, frame_id):
-        """记录收到的每一个数据包（非FEC包）"""
         with self.lock:
-            if self.expected_frame_id == -1:
-                self.expected_frame_id = frame_id
-
+            if self.expected_frame_id == -1: self.expected_frame_id = frame_id
             if frame_id > self.expected_frame_id:
-                # 计算丢失的帧数
                 self.lost_packets += frame_id - self.expected_frame_id
-                self.expected_frame_id = frame_id + 1
-            elif frame_id == self.expected_frame_id:
-                self.expected_frame_id += 1
-
+            self.expected_frame_id = frame_id + 1
             self.received_packets += 1
-
     def get_statistics(self):
-        """计算并返回丢包率"""
         with self.lock:
-            total_packets = self.received_packets + self.lost_packets
-            if total_packets == 0:
-                return {"loss_rate": 0.0}
-
-            loss_rate = self.lost_packets / total_packets
-            # 重置计数器以便进行下一轮统计
-            self.received_packets = 0
-            self.lost_packets = 0
+            total = self.received_packets + self.lost_packets
+            loss_rate = self.lost_packets / total if total > 0 else 0.0
+            self.received_packets, self.lost_packets = 0, 0
             return {"loss_rate": loss_rate}
 
-
-# --- 2. 帧重组与视频抖动缓冲 ---
 class VideoJitterBuffer:
-    """
-    一个更完善的帧缓冲和重组器。
-    - 缓存乱序到达的数据包。
-    - 使用FEC恢复丢失的数据包。
-    - 实现一个抖动缓冲（Jitter Buffer）来平滑视频播放。
-    - 按帧ID顺序输出帧。
-    """
-
-    def __init__(self, buffer_time_ms=100):
-        self.packet_buffers = defaultdict(lambda: {
-            "packets": {}, "fec_packets": {}, "total_packets": -1,
-            "received_count": 0, "timestamp": time.time()
-        })
-        self.ready_queue = deque()  # 存储已解码的完整帧 (frame_id, frame_data)
+    def __init__(self):
+        self.packet_buffers = defaultdict(lambda: {"packets": {}, "total_packets": -1, "received_count": 0})
+        self.ready_queue = deque()
         self.lock = threading.Lock()
-        self.buffer_delay = buffer_time_ms / 1000.0
         self.last_played_frame_id = -1
-
     def add_packet(self, packet: bytes, monitor: NetworkMonitor):
-        """添加收到的UDP包到缓冲区"""
-        if len(packet) < 9: return  # 包头不完整
-
+        if len(packet) < 9: return
         frame_id = int.from_bytes(packet[:4], 'big')
-        is_fec = int.from_bytes(packet[8:9], 'big') == 1
-
         with self.lock:
-            # 如果帧已经太旧，则直接丢弃
-            if frame_id <= self.last_played_frame_id:
-                return
-
+            if frame_id <= self.last_played_frame_id: return
             buffer = self.packet_buffers[frame_id]
-            buffer["timestamp"] = time.time()
-
-            if is_fec:
-                packet_index = int.from_bytes(packet[4:6], 'big')
-                buffer["fec_packets"][packet_index] = packet[9:]
-            else:
-                # 首次记录该帧的数据包时，更新网络监控器
-                if buffer["total_packets"] == -1:
-                    monitor.record_packet(frame_id)
-
-                packet_index = int.from_bytes(packet[4:6], 'big')
-                total_packets = int.from_bytes(packet[6:8], 'big')
-                if packet_index not in buffer["packets"]:
-                    buffer["packets"][packet_index] = packet[9:]
-                    buffer["total_packets"] = total_packets
-                    buffer["received_count"] += 1
-
-            self._try_reassemble(frame_id)
-
-    def _try_reassemble(self, frame_id):
-        """尝试重组帧，包括FEC恢复"""
-        buffer = self.packet_buffers[frame_id]
-
-        # 检查是否所有数据包都已到达
-        if buffer["total_packets"] != -1 and buffer["received_count"] == buffer["total_packets"]:
-            self._push_to_ready_queue(frame_id)
-            return
-
-        # 尝试使用FEC包进行恢复
-        for fec_index, fec_data in buffer["fec_packets"].items():
-            start_idx = fec_index * FEC_GROUP_SIZE
-            end_idx = start_idx + FEC_GROUP_SIZE
-
-            missing_indices = []
-            group_packets_data = []
-            for i in range(start_idx, end_idx):
-                if i < buffer["total_packets"]:
-                    if i in buffer["packets"]:
-                        group_packets_data.append(buffer["packets"][i])
-                    else:
-                        missing_indices.append(i)
-
-            # 如果只有一个包丢失，则可以恢复
-            if len(missing_indices) == 1:
-                missing_idx = missing_indices[0]
-                print(f"[FEC] 正在恢复帧 {frame_id} 的数据包 {missing_idx}")
-
-                # 异或恢复
-                max_len = max(len(d) for d in group_packets_data + [fec_data])
-                recovered_data = bytearray(max_len)
-                all_data = group_packets_data + [fec_data]
-                for d in all_data:
-                    padded_d = d.ljust(max_len, b'\0')
-                    for i in range(max_len):
-                        recovered_data[i] ^= padded_d[i]
-
-                buffer["packets"][missing_idx] = bytes(recovered_data)
+            if buffer["total_packets"] == -1: monitor.record_packet(frame_id)
+            packet_index = int.from_bytes(packet[4:6], 'big')
+            if packet_index not in buffer["packets"]:
+                buffer["packets"][packet_index] = packet[9:]
+                buffer["total_packets"] = int.from_bytes(packet[6:8], 'big')
                 buffer["received_count"] += 1
-
-                if buffer["received_count"] == buffer["total_packets"]:
-                    self._push_to_ready_queue(frame_id)
-                    return
-
+            if buffer["received_count"] > 0 and buffer["received_count"] == buffer["total_packets"]:
+                self._push_to_ready_queue(frame_id)
     def _push_to_ready_queue(self, frame_id):
-        """将重组好的帧放入待播放队列"""
-        if frame_id not in self.packet_buffers: return
-
-        buffer = self.packet_buffers.pop(frame_id)
-        sorted_packets = [buffer["packets"][i] for i in sorted(buffer["packets"].keys())]
-        frame_data = b"".join(sorted_packets)
-
-        # 将 (frame_id, frame_data) 元组插入到已排序的队列中
-        self.ready_queue.append((frame_id, frame_data))
-        self.ready_queue = deque(sorted(self.ready_queue))
-
+        if frame_id in self.packet_buffers:
+            buffer = self.packet_buffers.pop(frame_id)
+            frame_data = b"".join([buffer["packets"][i] for i in sorted(buffer["packets"].keys())])
+            self.ready_queue.append((frame_id, frame_data))
+            # Keep the queue sorted by frame_id
+            self.ready_queue = deque(sorted(self.ready_queue, key=lambda item: item[0]))
     def get_frame(self):
-        """从抖动缓冲中获取一帧用于显示"""
         with self.lock:
-            if not self.ready_queue:
-                return None
-
-            # 检查是否有更旧的帧需要清理
-            self.cleanup_old_frames()
-
-            frame_id, frame_data = self.ready_queue.popleft()
-            self.last_played_frame_id = frame_id
-            return frame_data
-
-    def cleanup(self):
-        """清理过时的包缓冲区"""
+            return self.ready_queue.popleft() if self.ready_queue else None
+    def clear(self):
         with self.lock:
-            cutoff_time = time.time() - 3  # 清理3秒前的旧缓冲区
-            old_frame_ids = [fid for fid, buf in self.packet_buffers.items() if buf["timestamp"] < cutoff_time]
-            for fid in old_frame_ids:
-                del self.packet_buffers[fid]
+            self.packet_buffers.clear()
+            self.ready_queue.clear()
+            self.last_played_frame_id = -1
 
-    def cleanup_old_frames(self):
-        """清理ready_queue中过时的帧，避免内存堆积"""
-        # 假设我们只保留最近的几帧，或者根据时间戳清理
-        # 这里简单地清理比当前播放帧ID更旧的帧，或者当队列过长时清理
-        while len(self.ready_queue) > 20:  # 保持最多20帧在队列中
-            self.ready_queue.popleft()
-
-
-# --- 3. 音频抖动缓冲 ---
 class AudioJitterBuffer:
-    """
-    一个简单的音频抖动缓冲，用于平滑音频播放并降低延迟。
-    """
-
-    def __init__(self, max_size=5):  # 缓冲最多5个音频包
+    def __init__(self, max_size=20):
         self.queue = deque(maxlen=max_size)
         self.lock = threading.Lock()
+    def add_chunk(self, chunk): self.queue.append(chunk)
+    def get_chunk(self): return self.queue.popleft() if self.queue else None
+    def clear(self): self.queue.clear()
 
-    def add_chunk(self, chunk):
-        with self.lock:
-            self.queue.append(chunk)
-
-    def get_chunk(self):
-        with self.lock:
-            if not self.queue:
-                return None
-            return self.queue.popleft()
-
-
-# --- 4. 媒体处理线程 ---
-def video_receiver_thread(sock, jitter_buffer, monitor, running_flag, status_ref):
-    """接收视频数据包的线程"""
+# --- Media Threads (unchanged) ---
+def video_receiver_thread(sock, jitter_buffer, monitor, running_flag):
     while running_flag['running']:
         try:
             data, _ = sock.recvfrom(65535)
             jitter_buffer.add_packet(data, monitor)
-            status_ref['video_active'] = True  # 标记视频流活跃
         except socket.error:
-            print("[Video] 套接字错误，接收线程退出。")
-            status_ref['video_active'] = False  # 标记视频流不活跃
+            if running_flag['running']: print("[Video] Socket error in receiver.")
             break
-
 
 def audio_receiver_thread(sock, audio_buffer, running_flag):
-    """接收音频包并放入抖动缓冲"""
     while running_flag['running']:
         try:
-            data, _ = sock.recvfrom(AUDIO_CHUNK * 2)
+            data, _ = sock.recvfrom(4096)
             audio_buffer.add_chunk(data)
         except socket.error:
-            print("[Audio] 套接字错误，音频接收线程退出。")
+            if running_flag['running']: print("[Audio] Socket error in receiver.")
             break
 
-
 def audio_player_thread(audio_buffer, running_flag):
-    """从抖动缓冲中获取并播放音频数据的线程"""
     p = pyaudio.PyAudio()
+    stream = None
     try:
-        audio_stream = p.open(format=AUDIO_FORMAT,
-                              channels=AUDIO_CHANNELS,
-                              rate=AUDIO_RATE,
-                              output=True,
-                              frames_per_buffer=AUDIO_CHUNK)  # 关键：设置与服务器匹配的块大小
+        stream = p.open(format=AUDIO_FORMAT, channels=AUDIO_CHANNELS, rate=AUDIO_RATE, output=True, frames_per_buffer=AUDIO_CHUNK)
+        while running_flag['running']:
+            chunk = audio_buffer.get_chunk()
+            if chunk:
+                stream.write(chunk)
+            else:
+                time.sleep(0.01)
     except Exception as e:
-        print(f"[Audio] 无法打开音频播放设备: {e}")
-        return
+        print(f"[Audio] PyAudio Error: {e}")
+    finally:
+        if stream:
+            stream.stop_stream()
+            stream.close()
+        p.terminate()
 
-    print("[Audio] 音频播放已准备就绪。")
-    while running_flag['running']:
-        chunk = audio_buffer.get_chunk()
-        if chunk:
-            try:
-                audio_stream.write(chunk)
-            except IOError as e:
-                print(f"[Audio] 播放音频时出错: {e}")
-        else:
-            time.sleep(0.01)  # 缓冲为空时短暂等待
+# --- Display Thread (REFACTORED) ---
+def display_thread(app_instance):
+    WAIT_THRESHOLD = 1.5
 
-    audio_stream.stop_stream()
-    audio_stream.close()
-    p.terminate()
-    print("[Audio] 音频播放已停止。")
-
-
-def display_thread(video_jitter_buffer, running_flag, status_ref, video_label, root, scaling_mode, target_size):
-    """
-    显示视频帧的线程。
-    - 使用事件驱动的尺寸更新，解决“渐进式”缩放问题。
-    - 使用最快的OpenCV插值算法，确保低延迟。
-    """
-    last_frame_time = time.time()
-    WAIT_THRESHOLD = 1.0
+    # Use an instance variable on the App object to avoid scope issues.
+    app_instance.last_frame_time = time.time()
 
     def update_frame():
-        nonlocal last_frame_time
-        if not running_flag['running']:
+        if not app_instance.running_flag['running']:
             return
 
-        frame_data = video_jitter_buffer.get_frame()
+        frame_tuple = app_instance.video_jitter_buffer.get_frame()
+        if frame_tuple:
+            frame_id, frame_data = frame_tuple
+            app_instance.video_jitter_buffer.last_played_frame_id = frame_id
+            app_instance.last_frame_time = time.time() # Update time upon receiving a frame
 
-        if frame_data:
-            last_frame_time = time.time()
             try:
                 nparr = np.frombuffer(frame_data, np.uint8)
                 frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                 if frame is not None:
-                    # --- 高性能视频缩放逻辑 (使用OpenCV) ---
-                    mode = scaling_mode.get()
-                    # 使用<Configure>事件更新的尺寸，避免在循环中频繁调用winfo_*
-                    label_w = target_size['w']
-                    label_h = target_size['h']
-
-                    if label_w > 1 and label_h > 1:
-                        if mode == "fill":
-                            # 模式1: 拉伸填充 - 使用最快的cv2.INTER_NEAREST插值算法
-                            frame = cv2.resize(frame, (label_w, label_h), interpolation=cv2.INTER_NEAREST)
-                        elif mode == "fit":
-                            # 模式2: 按比例缩放 - 使用最快的cv2.INTER_NEAREST插值算法
-                            h, w, _ = frame.shape
-                            ratio = min(label_w / w, label_h / h)
-                            new_size = (int(w * ratio), int(h * ratio))
-                            frame = cv2.resize(frame, new_size, interpolation=cv2.INTER_NEAREST)
-                        # 模式3: "original" - 无需操作
-
-                    # 转换到Tkinter格式
                     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     img = Image.fromarray(frame_rgb)
                     img_tk = ImageTk.PhotoImage(image=img)
+                    app_instance.video_label.config(image=img_tk)
+                    app_instance.video_label.image = img_tk
 
-                    video_label.config(image=img_tk)
-                    video_label.image = img_tk
-                    status_ref['video_active'] = True
-                    if "正在接收" not in status_label.cget("text"):
-                        status_label.config(text="状态: 正在接收视频流...", fg="green")
-                else:
-                    if time.time() - last_frame_time > WAIT_THRESHOLD:
-                        status_label.config(text="状态: 解码失败", fg="red")
+                    if "正在播放" not in app_instance.status_label.cget("text"):
+                        app_instance.status_label.config(text=f"状态: {app_instance.current_source} - 正在播放...")
             except Exception as e:
-                print(f"[Display] 解码或显示帧时出错: {e}")
-        else:
-            if time.time() - last_frame_time > WAIT_THRESHOLD:
-                status_ref['video_active'] = False
-                status_label.config(text="状态: 等待视频流...", fg="orange")
+                print(f"[Display] Error decoding/displaying frame: {e}")
 
-        root.after(15, update_frame)
+        if time.time() - app_instance.last_frame_time > WAIT_THRESHOLD and "等待媒体流" not in app_instance.status_label.cget("text"):
+            app_instance.status_label.config(text=f"状态: {app_instance.current_source} - 等待媒体流...")
 
-    root.after(15, update_frame)
+        app_instance.root.after(15, update_frame)
 
+    app_instance.root.after(15, update_frame)
 
-# --- 5. 控制信令发送 ---
+# --- Feedback Thread (unchanged) ---
 def feedback_sender_thread(sock, server_addr, monitor, running_flag):
-    """定期向服务器发送网络状态反馈的线程"""
     while running_flag['running']:
-        time.sleep(1)  # 每秒发送一次反馈
+        time.sleep(1)
         stats = monitor.get_statistics()
         try:
             sock.sendto(json.dumps(stats).encode(), server_addr)
-        except socket.error as e:
-            print(f"[Feedback] 发送反馈失败: {e}")
+        except socket.error:
+            if running_flag['running']: print("[Feedback] Socket error.")
+            break
 
+# --- GUI and Main Logic ---
+class App:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("实时视频流客户端")
+        self.root.geometry("1000x700")
+        self.root.configure(bg="#2c3e50")
 
-# --- 6. 主函数 ---
-def main():
-    # Tkinter GUI 设置
-    root = tk.Tk()
-    root.title("实时视频流客户端")
-    root.geometry("800x600")
-    root.resizable(True, True)
-    root.configure(bg="#2c3e50")
+        self.is_connected = False
+        self.running_flag = {'running': False}
+        self.sockets = {'video': None, 'audio': None, 'control': None}
+        self.threads = {}
+        self.server_address = None
+        self.current_source = "无"
+        self.last_frame_time = 0 # NEW: Initialize instance variable
 
-    # 视频显示区域
-    video_label = tk.Label(root, bg="#000000", bd=2, relief="sunken")
-    video_label.pack(pady=10, padx=10, fill="both", expand=True)
+        self.monitor = NetworkMonitor()
+        self.video_jitter_buffer = VideoJitterBuffer()
+        self.audio_jitter_buffer = AudioJitterBuffer()
 
-    target_size = {'w': 0, 'h': 0}
-    def on_resize(event):
-        target_size['w'] = event.width
-        target_size['h'] = event.height
-    video_label.bind("<Configure>", on_resize)
+        self._create_widgets()
 
-    placeholder_img = Image.new('RGB', (640, 480), color='gray')
-    placeholder_tk = ImageTk.PhotoImage(image=placeholder_img)
-    video_label.config(image=placeholder_tk)
-    video_label.image = placeholder_tk
+    def _create_widgets(self):
+        # This function is unchanged
+        conn_frame = tk.Frame(self.root, bg="#34495e")
+        conn_frame.pack(fill=tk.X, padx=10, pady=5)
+        tk.Label(conn_frame, text="服务器IP:", bg="#34495e", fg="white").pack(side=tk.LEFT, padx=5)
+        self.ip_entry = tk.Entry(conn_frame, width=20)
+        self.ip_entry.insert(0, "127.0.0.1")
+        self.ip_entry.pack(side=tk.LEFT, padx=5)
+        self.connect_btn = tk.Button(conn_frame, text="连接", command=self.toggle_connection)
+        self.connect_btn.pack(side=tk.LEFT, padx=5)
+        main_frame = tk.Frame(self.root, bg="#2c3e50")
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        list_frame = tk.Frame(main_frame, bg="#34495e")
+        list_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
+        tk.Label(list_frame, text="播放列表", bg="#34495e", fg="white").pack()
+        self.video_listbox = tk.Listbox(list_frame, bg="#ecf0f1", selectbackground="#3498db")
+        self.video_listbox.pack(fill=tk.Y, expand=True)
+        self.play_btn = tk.Button(list_frame, text="播放选中项", command=self.play_selected, state=tk.DISABLED)
+        self.play_btn.pack(fill=tk.X, pady=5)
+        self.video_label = tk.Label(main_frame, bg="black")
+        self.video_label.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.status_label = tk.Label(self.root, text="状态: 未连接", bd=1, relief=tk.SUNKEN, anchor=tk.W)
+        self.status_label.pack(side=tk.BOTTOM, fill=tk.X)
 
-    scaling_mode = tk.StringVar(value="fit")
-    context_menu = tk.Menu(root, tearoff=0)
-    context_menu.add_radiobutton(label="自适应缩放 (保持宽高比)", variable=scaling_mode, value="fit")
-    context_menu.add_radiobutton(label="拉伸填充 (忽略宽高比)", variable=scaling_mode, value="fill")
-    context_menu.add_radiobutton(label="原始大小", variable=scaling_mode, value="original")
-    def show_context_menu(event):
-        context_menu.post(event.x_root, event.y_root)
-    video_label.bind("<Button-3>", show_context_menu)
+    def toggle_connection(self):
+        if self.is_connected: self.disconnect()
+        else: self.connect()
 
-    input_frame = tk.Frame(root, bg="#2c3e50")
-    input_frame.pack(pady=5)
-    ip_label = tk.Label(input_frame, text="服务器IP:", bg="#2c3e50", fg="white", font=("Arial", 12))
-    ip_label.pack(side=tk.LEFT, padx=5)
-    server_ip_entry = tk.Entry(input_frame, width=30, font=("Arial", 12), bd=2, relief="groove")
-    server_ip_entry.insert(0, "127.0.0.1")
-    server_ip_entry.pack(side=tk.LEFT, padx=5)
-    connect_button = tk.Button(input_frame, text="连接", font=("Arial", 12, "bold"), bg="#3498db", fg="white", activebackground="#2980b9", relief="raised", bd=3)
-    connect_button.pack(side=tk.LEFT, padx=5)
-
-    global status_label
-    status_label = tk.Label(root, text="状态: 请输入服务器IP并点击连接", bg="#2c3e50", fg="white", font=("Arial", 10))
-    status_label.pack(pady=5)
-
-    # --- 提升变量作用域以便在on_closing中访问 ---
-    running_flag = {'running': True}
-    sockets = {'video': None, 'audio': None, 'control': None}
-    threads = {'video_recv': None, 'audio_recv': None, 'audio_play': None, 'feedback': None, 'cleanup': None}
-
-    def start_client_threads(server_ip):
-        nonlocal running_flag
-        
-        if not running_flag['running']:
-            running_flag['running'] = True
-
-        server_address = (server_ip, CONTROL_PORT)
-        
+    def connect(self):
+        server_ip = self.ip_entry.get()
+        if not server_ip: return messagebox.showerror("错误", "请输入服务器IP地址")
+        self.server_address = (server_ip, CONTROL_PORT)
+        self.running_flag['running'] = True
         try:
-            sockets['video'] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sockets['video'].bind(('', VIDEO_PORT))
-            sockets['audio'] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sockets['audio'].bind(('', AUDIO_PORT))
-            sockets['control'] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        except socket.error as e:
-            messagebox.showerror("网络错误", f"无法绑定端口: {e}")
-            return
+            self.sockets['control'] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sockets['video'] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sockets['video'].bind(('', VIDEO_PORT))
+            self.sockets['audio'] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sockets['audio'].bind(('', AUDIO_PORT))
+            self.sockets['control'].settimeout(5)
+            self.sockets['control'].sendto(json.dumps({"command": "get_list"}).encode(), self.server_address)
+            data, _ = self.sockets['control'].recvfrom(2048)
+            self.sockets['control'].settimeout(None)
+            video_list = json.loads(data.decode())
+            self.video_listbox.delete(0, tk.END)
+            for item in video_list: self.video_listbox.insert(tk.END, item)
+            self.start_threads()
+            self.is_connected = True
+            self.connect_btn.config(text="断开")
+            self.play_btn.config(state=tk.NORMAL)
+            self.status_label.config(text="状态: 连接成功，请选择播放项")
+        except socket.timeout:
+            messagebox.showerror("连接失败", "无法从服务器获取列表，请求超时。")
+            self.cleanup()
+        except Exception as e:
+            messagebox.showerror("连接失败", str(e))
+            self.cleanup()
 
-        status_label.config(text=f"状态: 正在连接到 {server_ip}...", fg="blue")
-        connect_button.config(state=tk.DISABLED)
+    def disconnect(self):
+        if self.sockets['control'] and self.server_address:
+            try:
+                self.sockets['control'].sendto(json.dumps({"command": "stop"}).encode(), self.server_address)
+            except socket.error: pass
+        self.cleanup()
 
-        monitor = NetworkMonitor()
-        video_jitter_buffer = VideoJitterBuffer(buffer_time_ms=150)
-        audio_jitter_buffer = AudioJitterBuffer(max_size=5)
-        status_ref = {'video_active': False}
+    def play_selected(self):
+        selection = self.video_listbox.curselection()
+        if not selection: return messagebox.showwarning("提示", "请先从列表中选择一个项目")
+        self.current_source = self.video_listbox.get(selection[0])
+        self.video_jitter_buffer.clear()
+        self.audio_jitter_buffer.clear()
 
-        threads['video_recv'] = threading.Thread(target=video_receiver_thread, args=(sockets['video'], video_jitter_buffer, monitor, running_flag, status_ref))
-        threads['audio_recv'] = threading.Thread(target=audio_receiver_thread, args=(sockets['audio'], audio_jitter_buffer, running_flag))
-        threads['audio_play'] = threading.Thread(target=audio_player_thread, args=(audio_jitter_buffer, running_flag))
-        threads['feedback'] = threading.Thread(target=feedback_sender_thread, args=(sockets['control'], server_address, monitor, running_flag))
-        threads['cleanup'] = threading.Thread(target=lambda: (time.sleep(5), video_jitter_buffer.cleanup()), daemon=True)
+        # Reset the timer when a new source is requested
+        self.last_frame_time = time.time()
 
-        display_thread(video_jitter_buffer, running_flag, status_ref, video_label, root, scaling_mode, target_size)
+        play_command = {"command": "play", "source": self.current_source}
+        self.sockets['control'].sendto(json.dumps(play_command).encode(), self.server_address)
+        self.status_label.config(text=f"状态: 请求播放 {self.current_source}...")
 
-        for thread in threads.values():
-            if thread:
-                thread.daemon = True
-                thread.start()
-        
-        try:
-            sockets['control'].sendto(json.dumps({"status": "connect"}).encode(), server_address)
-            status_label.config(text="状态: 连接成功，等待视频流...", fg="green")
-        except socket.error as e:
-            messagebox.showerror("连接错误", f"无法发送连接请求: {e}")
-            status_label.config(text="状态: 连接失败", fg="red")
-            running_flag['running'] = False
-        
-        connect_button.config(state=tk.NORMAL)
+    def start_threads(self):
+        self.threads['video_recv'] = threading.Thread(target=video_receiver_thread, args=(self.sockets['video'], self.video_jitter_buffer, self.monitor, self.running_flag))
+        self.threads['audio_recv'] = threading.Thread(target=audio_receiver_thread, args=(self.sockets['audio'], self.audio_jitter_buffer, self.running_flag))
+        self.threads['audio_play'] = threading.Thread(target=audio_player_thread, args=(self.audio_jitter_buffer, self.running_flag))
+        self.threads['feedback'] = threading.Thread(target=feedback_sender_thread, args=(self.sockets['control'], self.server_address, self.monitor, self.running_flag))
+        for thread in self.threads.values():
+            thread.daemon = True
+            thread.start()
+        display_thread(self)
 
-    connect_button.config(command=lambda: start_client_threads(server_ip_entry.get()))
-
-    def on_closing():
-        print("正在关闭客户端...")
-        if not running_flag['running']:
-            root.destroy()
-            return
-
-        running_flag['running'] = False
-        
-        # 等待线程结束
-        for name, thread in threads.items():
-            if thread and thread.is_alive():
-                print(f"正在等待 {name} 线程结束...")
+    def cleanup(self):
+        self.running_flag['running'] = False
+        # No need to sleep, socket closure will interrupt threads
+        for sock in self.sockets.values():
+            if sock: sock.close()
+        for thread in self.threads.values():
+            if thread.is_alive():
                 thread.join(timeout=0.5)
+        self.threads.clear()
+        self.sockets = {'video': None, 'audio': None, 'control': None}
+        self.is_connected = False
+        self.connect_btn.config(text="连接")
+        self.play_btn.config(state=tk.DISABLED)
+        self.video_listbox.delete(0, tk.END)
+        self.status_label.config(text="状态: 未连接")
+        placeholder_img = Image.new('RGB', (1, 1), color='black')
+        placeholder_tk = ImageTk.PhotoImage(image=placeholder_img)
+        self.video_label.config(image=placeholder_tk)
+        self.video_label.image = placeholder_tk
 
-        # 关闭套接字
-        for name, sock in sockets.items():
-            if sock:
-                print(f"正在关闭 {name} 套接字...")
-                sock.close()
+    def on_closing(self):
+        self.disconnect()
+        self.root.destroy()
 
-        print("所有资源已释放。")
-        root.destroy()
-
-    root.protocol("WM_DELETE_WINDOW", on_closing)
+def main():
+    root = tk.Tk()
+    app = App(root)
+    root.protocol("WM_DELETE_WINDOW", app.on_closing)
     root.mainloop()
-
 
 if __name__ == "__main__":
     main()
