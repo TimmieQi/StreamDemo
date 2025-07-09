@@ -3,6 +3,7 @@ import socket
 import time
 import threading
 import json
+import pyaudio
 from shared_config import *
 
 # --- 1. 自适应流控器 ---
@@ -104,10 +105,50 @@ def generate_fec_packets(data_packets: list) -> list:
         fec_packets.append(header + fec_packet_data[9:]) # 替换头部
     return fec_packets
 
-# --- 4. 主函数：视频捕获与推流 ---
+# --- 4. 音频推流线程 ---
+def audio_streamer(audio_sock, client_address_ref):
+    """
+    捕获麦克风音频并将其推流到客户端。
+    """
+    p = pyaudio.PyAudio()
+    try:
+        audio_stream = p.open(format=AUDIO_FORMAT,
+                              channels=AUDIO_CHANNELS,
+                              rate=AUDIO_RATE,
+                              input=True,
+                              frames_per_buffer=AUDIO_CHUNK)
+    except Exception as e:
+        print(f"[Audio] 无法打开音频设备: {e}")
+        print("[Audio] 请确保已安装PyAudio并且有可用的麦克风。")
+        return
+
+    print("[Audio] 音频推流已启动...")
+    while True:
+        if client_address_ref['addr']:
+            try:
+                data = audio_stream.read(AUDIO_CHUNK)
+                audio_sock.sendto(data, (client_address_ref['addr'][0], AUDIO_PORT))
+            except IOError as e:
+                # 通常发生在音频设备改变或出现问题时
+                print(f"[Audio] 读取音频流时出错: {e}")
+                break
+            except socket.error:
+                # 客户端断开连接
+                print("[Audio] 客户端连接已断开，停止音频推流。")
+                break
+        else:
+            time.sleep(0.1) # 等待客户端连接
+
+    audio_stream.stop_stream()
+    audio_stream.close()
+    p.terminate()
+    print("[Audio] 音频推流已停止。")
+
+# --- 5. 主函数：视频捕获与推流 ---
 def main():
     # 初始化UDP套接字
     video_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    audio_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     control_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     control_sock.bind((SERVER_HOST, CONTROL_PORT))
 
@@ -122,6 +163,14 @@ def main():
         daemon=True
     )
     control_thread.start()
+
+    # 启动音频推流线程
+    audio_thread = threading.Thread(
+        target=audio_streamer,
+        args=(audio_sock, client_address_ref),
+        daemon=True
+    )
+    audio_thread.start()
 
     print(f"[Server] 服务器已启动。在 {SERVER_HOST}:{CONTROL_PORT} 等待客户端连接...")
 
@@ -185,9 +234,9 @@ def main():
     # 清理资源
     cap.release()
     video_sock.close()
+    audio_sock.close()
     control_sock.close()
     print("[Server] 服务器已关闭。")
 
 if __name__ == "__main__":
     main()
-4
