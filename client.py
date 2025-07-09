@@ -4,6 +4,7 @@ import numpy as np
 import threading
 import time
 import json
+import pyaudio
 from collections import defaultdict, deque
 
 # 从共享配置文件中导入设置
@@ -177,7 +178,7 @@ class JitterBuffer:
                 print(f"[Cleanup] 清理过时的帧缓冲: {fid}")
                 del self.packet_buffers[fid]
 
-# --- 3. 视频接收与显示 ---
+# --- 3. 媒体处理线程 ---
 def video_receiver_thread(sock, jitter_buffer, monitor, running_flag):
     """接收视频数据包的线程"""
     while running_flag['running']:
@@ -187,6 +188,35 @@ def video_receiver_thread(sock, jitter_buffer, monitor, running_flag):
         except socket.error:
             print("[Video] 套接字错误，接收线程退出。")
             break
+
+def audio_player_thread(sock, running_flag):
+    """接收并播放音频数据的线程"""
+    p = pyaudio.PyAudio()
+    try:
+        audio_stream = p.open(format=AUDIO_FORMAT,
+                              channels=AUDIO_CHANNELS,
+                              rate=AUDIO_RATE,
+                              output=True,
+                              frames_per_buffer=AUDIO_CHUNK)
+    except Exception as e:
+        print(f"[Audio] 无法打开音频播放设备: {e}")
+        return
+
+    print("[Audio] 音频播放已准备就绪。")
+    while running_flag['running']:
+        try:
+            data, _ = sock.recvfrom(AUDIO_CHUNK * 2) # 缓冲区稍大一些
+            audio_stream.write(data)
+        except socket.error:
+            print("[Audio] 套接字错误，音频播放线程退出。")
+            break
+        except IOError as e:
+            print(f"[Audio] 播放音频时出错: {e}")
+
+    audio_stream.stop_stream()
+    audio_stream.close()
+    p.terminate()
+    print("[Audio] 音频播放已停止。")
 
 def display_thread(jitter_buffer, running_flag):
     """显示视频帧的线程"""
@@ -226,6 +256,8 @@ def main():
     # 初始化套接字
     video_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     video_sock.bind(('', VIDEO_PORT)) # 绑定到所有接口的视频端口
+    audio_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    audio_sock.bind(('', AUDIO_PORT)) # 绑定到音频端口
     control_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     # 初始化核心组件
@@ -237,6 +269,11 @@ def main():
     recv_thread = threading.Thread(target=video_receiver_thread, args=(video_sock, jitter_buffer, monitor, running_flag))
     recv_thread.daemon = True
     recv_thread.start()
+
+    # 启动音频播放线程
+    audio_thread = threading.Thread(target=audio_player_thread, args=(audio_sock, running_flag))
+    audio_thread.daemon = True
+    audio_thread.start()
 
     # 启动视频显示线程
     disp_thread = threading.Thread(target=display_thread, args=(jitter_buffer, running_flag))
@@ -257,7 +294,7 @@ def main():
     control_sock.sendto(json.dumps({"status": "connect"}).encode(), server_address)
     feedback_thread.start() # 在发送第一个包后启动反馈
 
-    print("连接成功。视频流应在几秒钟内开始。")
+    print("连接成功。音视频流应在几秒钟内开始。")
     print("在视频窗口按 'q' 键退出。")
 
     # 等待显示线程结束 (当用户按'q'时)
@@ -266,9 +303,11 @@ def main():
     print("正在关闭客户端...")
     running_flag['running'] = False
     video_sock.close()
+    audio_sock.close()
     control_sock.close()
     # 等待其他线程优雅退出
     recv_thread.join(timeout=1)
+    audio_thread.join(timeout=1)
     feedback_thread.join(timeout=1)
 
 if __name__ == "__main__":
