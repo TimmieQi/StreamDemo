@@ -350,185 +350,129 @@ def main():
     # Tkinter GUI 设置
     root = tk.Tk()
     root.title("实时视频流客户端")
-    root.geometry("800x600")  # 初始窗口大小
-    root.resizable(True, True)  # 允许调整大小
-    root.configure(bg="#2c3e50")  # 深色背景
+    root.geometry("800x600")
+    root.resizable(True, True)
+    root.configure(bg="#2c3e50")
 
     # 视频显示区域
     video_label = tk.Label(root, bg="#000000", bd=2, relief="sunken")
     video_label.pack(pady=10, padx=10, fill="both", expand=True)
 
-    # --- 事件驱动的尺寸更新 ---
-    # 创建一个字典来存储视频标签的尺寸，由<Configure>事件更新
-    # 这可以避免在渲染循环中反复调用winfo_width/height，并解决“渐进式”缩放问题
     target_size = {'w': 0, 'h': 0}
     def on_resize(event):
-        # 当窗口大小改变时，更新目标尺寸
         target_size['w'] = event.width
         target_size['h'] = event.height
-    video_label.bind("<Configure>", on_resize) # 绑定尺寸变更事件
+    video_label.bind("<Configure>", on_resize)
 
-    # 初始占位符图像
     placeholder_img = Image.new('RGB', (640, 480), color='gray')
     placeholder_tk = ImageTk.PhotoImage(image=placeholder_img)
     video_label.config(image=placeholder_tk)
     video_label.image = placeholder_tk
 
-    # --- 视频缩放选项 ---
-    scaling_mode = tk.StringVar(value="fit") # 默认是按比例缩放
-    
-    # 创建右键菜单
+    scaling_mode = tk.StringVar(value="fit")
     context_menu = tk.Menu(root, tearoff=0)
     context_menu.add_radiobutton(label="自适应缩放 (保持宽高比)", variable=scaling_mode, value="fit")
     context_menu.add_radiobutton(label="拉伸填充 (忽略宽高比)", variable=scaling_mode, value="fill")
     context_menu.add_radiobutton(label="原始大小", variable=scaling_mode, value="original")
-
     def show_context_menu(event):
         context_menu.post(event.x_root, event.y_root)
+    video_label.bind("<Button-3>", show_context_menu)
 
-    video_label.bind("<Button-3>", show_context_menu) # 绑定右键点击事件
-
-    # IP 输入框和连接按钮
     input_frame = tk.Frame(root, bg="#2c3e50")
     input_frame.pack(pady=5)
-
     ip_label = tk.Label(input_frame, text="服务器IP:", bg="#2c3e50", fg="white", font=("Arial", 12))
     ip_label.pack(side=tk.LEFT, padx=5)
-
     server_ip_entry = tk.Entry(input_frame, width=30, font=("Arial", 12), bd=2, relief="groove")
-    server_ip_entry.insert(0, "127.0.0.1")  # 默认本地IP
+    server_ip_entry.insert(0, "127.0.0.1")
     server_ip_entry.pack(side=tk.LEFT, padx=5)
-
-    connect_button = tk.Button(input_frame, text="连接", command=lambda: start_client_threads(server_ip_entry.get()),
-                               font=("Arial", 12, "bold"), bg="#3498db", fg="white", activebackground="#2980b9",
-                               relief="raised", bd=3)
+    connect_button = tk.Button(input_frame, text="连接", font=("Arial", 12, "bold"), bg="#3498db", fg="white", activebackground="#2980b9", relief="raised", bd=3)
     connect_button.pack(side=tk.LEFT, padx=5)
 
-    # 状态显示
-    global status_label  # 使其在 display_thread 中可访问
+    global status_label
     status_label = tk.Label(root, text="状态: 请输入服务器IP并点击连接", bg="#2c3e50", fg="white", font=("Arial", 10))
     status_label.pack(pady=5)
 
-    # 日志输出区域 (可选)
-    # log_text = scrolledtext.ScrolledText(root, height=5, bg="#34495e", fg="white", font=("Arial", 9))
-    # log_text.pack(pady=5, padx=10, fill="x")
-    # def print_to_log(text):
-    #     log_text.insert(tk.END, text + "\n")
-    #     log_text.see(tk.END)
-    # import sys
-    # sys.stdout.write = print_to_log # 重定向print输出到日志框
-
-    # 初始化核心组件，这些需要全局或通过参数传递
-    monitor = NetworkMonitor()
-    video_jitter_buffer = VideoJitterBuffer(buffer_time_ms=150)
-    audio_jitter_buffer = AudioJitterBuffer(max_size=5)
+    # --- 提升变量作用域以便在on_closing中访问 ---
     running_flag = {'running': True}
-    status_ref = {'video_active': False}  # 用于在线程间共享视频活跃状态
+    sockets = {'video': None, 'audio': None, 'control': None}
+    threads = {'video_recv': None, 'audio_recv': None, 'audio_play': None, 'feedback': None, 'cleanup': None}
 
-    # 定义启动客户端线程的函数
     def start_client_threads(server_ip):
-        nonlocal monitor, video_jitter_buffer, audio_jitter_buffer, running_flag, status_ref
-
-        # 如果已经连接，先停止旧线程
-        if running_flag['running'] == False:  # 检查是否已经停止或需要重新初始化
-            # 重新初始化标志和缓冲区
+        nonlocal running_flag
+        
+        if not running_flag['running']:
             running_flag['running'] = True
-            monitor = NetworkMonitor()
-            video_jitter_buffer = VideoJitterBuffer(buffer_time_ms=150)
-            audio_jitter_buffer = AudioJitterBuffer(max_size=5)
-            status_ref = {'video_active': False}
 
         server_address = (server_ip, CONTROL_PORT)
-
-        # 初始化套接字 (每次连接时重新创建，防止旧连接问题)
+        
         try:
-            video_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            video_sock.bind(('', VIDEO_PORT))
-            audio_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            audio_sock.bind(('', AUDIO_PORT))
-            control_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sockets['video'] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sockets['video'].bind(('', VIDEO_PORT))
+            sockets['audio'] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sockets['audio'].bind(('', AUDIO_PORT))
+            sockets['control'] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         except socket.error as e:
-            messagebox.showerror("网络错误", f"无法绑定端口或创建套接字: {e}")
-            status_label.config(text="状态: 网络初始化失败", fg="red")
+            messagebox.showerror("网络错误", f"无法绑定端口: {e}")
             return
 
         status_label.config(text=f"状态: 正在连接到 {server_ip}...", fg="blue")
-        connect_button.config(state=tk.DISABLED)  # 连接中禁用按钮
+        connect_button.config(state=tk.DISABLED)
 
-        # 启动视频接收线程
-        video_recv_thread = threading.Thread(target=video_receiver_thread,
-                                             args=(video_sock, video_jitter_buffer, monitor, running_flag, status_ref))
-        video_recv_thread.daemon = True
-        video_recv_thread.start()
+        monitor = NetworkMonitor()
+        video_jitter_buffer = VideoJitterBuffer(buffer_time_ms=150)
+        audio_jitter_buffer = AudioJitterBuffer(max_size=5)
+        status_ref = {'video_active': False}
 
-        # 启动音频接收线程
-        audio_recv_thread = threading.Thread(target=audio_receiver_thread,
-                                             args=(audio_sock, audio_jitter_buffer, running_flag))
-        audio_recv_thread.daemon = True
-        audio_recv_thread.start()
+        threads['video_recv'] = threading.Thread(target=video_receiver_thread, args=(sockets['video'], video_jitter_buffer, monitor, running_flag, status_ref))
+        threads['audio_recv'] = threading.Thread(target=audio_receiver_thread, args=(sockets['audio'], audio_jitter_buffer, running_flag))
+        threads['audio_play'] = threading.Thread(target=audio_player_thread, args=(audio_jitter_buffer, running_flag))
+        threads['feedback'] = threading.Thread(target=feedback_sender_thread, args=(sockets['control'], server_address, monitor, running_flag))
+        threads['cleanup'] = threading.Thread(target=lambda: (time.sleep(5), video_jitter_buffer.cleanup()), daemon=True)
 
-        # 启动音频播放线程
-        audio_play_thread = threading.Thread(target=audio_player_thread, args=(audio_jitter_buffer, running_flag))
-        audio_play_thread.daemon = True
-        audio_play_thread.start()
-
-        # 启动视频显示线程 (现在由 Tkinter 的 after 方法驱动)
         display_thread(video_jitter_buffer, running_flag, status_ref, video_label, root, scaling_mode, target_size)
 
-        # 启动网络反馈发送线程
-        feedback_thread = threading.Thread(target=feedback_sender_thread,
-                                           args=(control_sock, server_address, monitor, running_flag))
-        feedback_thread.daemon = True
-
-        # 启动缓冲区清理线程
-        cleanup_thread = threading.Thread(target=lambda: (
-            time.sleep(5), video_jitter_buffer.cleanup()
-        ), daemon=True)
-        cleanup_thread.start()
-
-        # 尝试发送连接请求
+        for thread in threads.values():
+            if thread:
+                thread.daemon = True
+                thread.start()
+        
         try:
-            control_sock.sendto(json.dumps({"status": "connect"}).encode(), server_address)
-            feedback_thread.start()
+            sockets['control'].sendto(json.dumps({"status": "connect"}).encode(), server_address)
             status_label.config(text="状态: 连接成功，等待视频流...", fg="green")
         except socket.error as e:
-            messagebox.showerror("连接错误", f"无法发送连接请求到 {server_ip}: {e}")
+            messagebox.showerror("连接错误", f"无法发送连接请求: {e}")
             status_label.config(text="状态: 连接失败", fg="red")
-            running_flag['running'] = False  # 停止所有线程
-            connect_button.config(state=tk.NORMAL)  # 重新启用按钮
-            return
+            running_flag['running'] = False
+        
+        connect_button.config(state=tk.NORMAL)
 
-        connect_button.config(state=tk.NORMAL)  # 连接成功后重新启用按钮，允许重新连接
+    connect_button.config(command=lambda: start_client_threads(server_ip_entry.get()))
 
-    # 处理窗口关闭事件
     def on_closing():
         print("正在关闭客户端...")
+        if not running_flag['running']:
+            root.destroy()
+            return
+
         running_flag['running'] = False
-        # 确保所有套接字关闭
-        try:
-            video_sock.close()
-        except NameError:
-            pass  # 如果未初始化，则跳过
-        try:
-            audio_sock.close()
-        except NameError:
-            pass
-        try:
-            control_sock.close()
-        except NameError:
-            pass
+        
+        # 等待线程结束
+        for name, thread in threads.items():
+            if thread and thread.is_alive():
+                print(f"正在等待 {name} 线程结束...")
+                thread.join(timeout=0.5)
 
-        # 等待线程结束 (可选，但有助于确保资源释放)
-        # video_recv_thread.join(timeout=1)
-        # audio_recv_thread.join(timeout=1)
-        # audio_play_thread.join(timeout=1)
-        # feedback_thread.join(timeout=1)
+        # 关闭套接字
+        for name, sock in sockets.items():
+            if sock:
+                print(f"正在关闭 {name} 套接字...")
+                sock.close()
 
-        root.destroy()  # 销毁 Tkinter 窗口
+        print("所有资源已释放。")
+        root.destroy()
 
-    root.protocol("WM_DELETE_WINDOW", on_closing)  # 捕获窗口关闭事件
-
-    root.mainloop()  # 启动 Tkinter 事件循环
+    root.protocol("WM_DELETE_WINDOW", on_closing)
+    root.mainloop()
 
 
 if __name__ == "__main__":
