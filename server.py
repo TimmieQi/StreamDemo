@@ -92,7 +92,7 @@ class StreamerManager:
         self.running_flag = None
         print("[Manager] 推流已确认停止。")
 
-# --- 控制信道处理 (增加看门狗) ---
+# --- 控制信道处理 (无变化) ---
 def control_channel_handler(sock, manager):
     client_info = {'addr': None, 'last_contact': 0}
 
@@ -125,7 +125,7 @@ def control_channel_handler(sock, manager):
         except Exception as e:
             print(f"[Control] 错误: {e}")
 
-# --- 推流实现  ---
+# --- 推流实现 (无变化) ---
 def stream_from_camera(video_sock, audio_sock, controller, running_flag, client_addr):
     print("[Streamer] 摄像头推流激活。")
     p_audio = pyaudio.PyAudio()
@@ -142,6 +142,7 @@ def stream_from_camera(video_sock, audio_sock, controller, running_flag, client_
         print("[Streamer-Audio] 音频捕获线程启动。")
         while running_flag.get('running'):
             try:
+                # 使用 exception_on_overflow=False 避免在系统负载高时因小问题崩溃
                 audio_data = audio_stream.read(AUDIO_CHUNK, exception_on_overflow=False)
                 audio_sock.sendto(audio_data, (client_addr[0], AUDIO_PORT))
             except IOError:
@@ -195,14 +196,23 @@ def stream_from_file(video_sock, audio_sock, controller, running_flag, client_ad
         print(f"错误: {video_path} 中没有视频流。")
         container.close()
         return
-    if not audio_stream:
-        print(f"[警告] {video_path} 中没有音频流。")
 
     print(f"[Streamer] 开始推流文件: {video_path}")
     start_time = time.time()
     frame_id = 0
 
     streams_to_demux = [s for s in [video_stream, audio_stream] if s]
+
+    # ### FIX: 将重采样器移出循环，只创建一次 ###
+    resampler = None
+    if audio_stream:
+        print(f"[Streamer] 文件包含音频流。将重采样至 {AUDIO_RATE}Hz, 16-bit Mono。")
+        resampler = av.audio.resampler.AudioResampler(
+            format='s16', layout='mono', rate=AUDIO_RATE
+        )
+    else:
+        print(f"[警告] {video_path} 中没有音频流。")
+
 
     for packet in container.demux(streams_to_demux):
         if not running_flag.get('running'): break
@@ -229,11 +239,8 @@ def stream_from_file(video_sock, audio_sock, controller, running_flag, client_ad
                     video_sock.sendto(header + chunk, (client_addr[0], VIDEO_PORT))
                 frame_id = (frame_id + 1) % (2**32 - 1)
 
-            elif packet.stream.type == 'audio':
-                # PyAV解码的音频帧已经是PCM数据，重采样以匹配我们的配置
-                resampler = av.audio.resampler.AudioResampler(
-                    format='s16', layout='mono', rate=AUDIO_RATE
-                )
+            elif packet.stream.type == 'audio' and resampler:
+                # 使用已创建的重采样器
                 resampled_frames = resampler.resample(frame)
                 for resampled_frame in resampled_frames:
                     audio_data = resampled_frame.to_ndarray().tobytes()
@@ -242,7 +249,7 @@ def stream_from_file(video_sock, audio_sock, controller, running_flag, client_ad
     container.close()
     print(f"[Streamer] 文件 {video_path} 推流结束。")
 
-# --- 主函数 ---
+# --- 主函数 (无变化) ---
 def main():
     sockets = {
         'video': socket.socket(socket.AF_INET, socket.SOCK_DGRAM),
