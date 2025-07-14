@@ -1,242 +1,310 @@
+# server.py
+
+import io
 import cv2
 import socket
 import time
 import threading
 import json
+import os
+import av
 import pyaudio
+import numpy as np # 需要 numpy 来进行数据切片
+
 from shared_config import *
 
-# --- 1. 自适应流控器 ---
+
+# --- 视频文件扫描 (无变化) ---
+def get_video_files(path="videos"):
+    if not os.path.exists(path):
+        print(f"警告: 视频目录 '{path}' 不存在。将创建一个空目录。")
+        os.makedirs(path)
+        return []
+    supported_formats = ('.mp4', '.mkv', '.avi', '.mov')
+    return [f for f in os.listdir(path) if f.endswith(supported_formats)]
+
+
+# --- 自适应流控器 (无变化) ---
 class AdaptiveStreamController:
-    """
-    根据客户端反馈的网络状态，动态调整视频流参数。
-    """
     def __init__(self):
-        # 定义不同网络质量下的视频参数策略
         self.configs = {
-            "good": {"resolution": (640, 480), "jpeg_quality": 85, "fec_enabled": False, "fps_limit": 30},
-            "medium": {"resolution": (480, 360), "jpeg_quality": 60, "fec_enabled": True, "fps_limit": 20},
-            "poor": {"resolution": (320, 240), "jpeg_quality": 40, "fec_enabled": True, "fps_limit": 15},
+            "good": {"resolution": (640, 480), "jpeg_quality": 85, "fps_limit": 30},
+            "medium": {"resolution": (480, 360), "jpeg_quality": 60, "fps_limit": 20},
+            "poor": {"resolution": (320, 240), "jpeg_quality": 40, "fps_limit": 15},
         }
-        self.current_strategy_name = "good"  # 初始策略
+        self.current_strategy_name = "good"
         self.lock = threading.Lock()
 
     def get_current_strategy(self):
-        """获取当前生效的视频参数策略"""
         with self.lock:
             return self.configs[self.current_strategy_name]
 
     def update_strategy(self, loss_rate):
-        """
-        根据丢包率更新策略。
-        - 丢包率 < 3%: 网络良好
-        - 3% <= 丢包率 < 10%: 网络中等
-        - 丢包率 >= 10%: 网络差
-        """
         new_strategy_name = "good"
         if loss_rate >= 0.1:
             new_strategy_name = "poor"
         elif loss_rate >= 0.03:
             new_strategy_name = "medium"
-
         with self.lock:
             if self.current_strategy_name != new_strategy_name:
+                print(f"[服务端-控制器] 丢包率: {loss_rate:.2%}, 切换策略至: {new_strategy_name.upper()}")
                 self.current_strategy_name = new_strategy_name
-                print(f"[Controller] 丢包率: {loss_rate:.2%}, 切换策略至: {new_strategy_name.upper()}")
 
-# --- 2. 控制信道处理 ---
-def control_channel_handler(sock, controller, client_address_ref):
-    """
-    监听并处理来自客户端的控制信令。
-    """
-    print(f"[Control] 在端口 {CONTROL_PORT} 上监听客户端反馈...")
+
+# --- 推流管理器 (无变化) ---
+class StreamerManager:
+    def __init__(self, video_sock, audio_sock, controller):
+        self.video_sock = video_sock
+        self.audio_sock = audio_sock
+        self.controller = controller
+        self.current_stream_thread = None
+        self.running_flag = None
+        self.lock = threading.Lock()
+
+    def start_stream(self, source, client_addr):
+        with self.lock:
+            print("[服务端-管理器] 请求开启新推流...")
+            self.stop_stream()
+            self.running_flag = {'running': True}
+            if source == "camera":
+                print("[服务端-管理器] 启动摄像头直播...")
+                self.current_stream_thread = threading.Thread(
+                    target=stream_from_camera,
+                    args=(self.video_sock, self.audio_sock, self.controller, self.running_flag, client_addr),
+                    daemon=True
+                )
+            else:
+                video_path = os.path.join("videos", source)
+                if os.path.exists(video_path):
+                    print(f"[服务端-管理器] 启动文件点播: {source}")
+                    self.current_stream_thread = threading.Thread(
+                        target=stream_from_file,
+                        args=(
+                            self.video_sock, self.audio_sock, self.controller, self.running_flag, client_addr,
+                            video_path),
+                        daemon=True
+                    )
+                else:
+                    print(f"[服务端-管理器] 错误: 找不到视频文件 {video_path}")
+                    return
+            self.current_stream_thread.start()
+
+    def stop_stream(self):
+        if self.running_flag:
+            self.running_flag['running'] = False
+            print("[服务端-管理器] 发送停止信号到当前推流线程...")
+        if self.current_stream_thread and self.current_stream_thread.is_alive():
+            print("[服务端-管理器] 等待推流线程结束...")
+            self.current_stream_thread.join(timeout=1.0)
+        self.current_stream_thread = None
+        self.running_flag = None
+        print("[服务端-管理器] 推流已确认停止。")
+
+
+# --- 控制信道处理 (无变化) ---
+def control_channel_handler(sock, manager):
+    client_info = {'addr': None, 'last_contact': 0}
+
+    def watchdog():
+        while True:
+            time.sleep(5)
+            if client_info['addr'] and (time.time() - client_info['last_contact'] > 5):
+                print(f"[服务端-看门狗] 客户端 {client_info['addr']} 超时，停止推流。")
+                manager.stop_stream()
+                client_info['addr'] = None
+
+    threading.Thread(target=watchdog, daemon=True).start()
+
+    video_list = get_video_files()
+    print(f"[服务端-控制] 可用视频文件: {video_list}")
     while True:
         try:
             data, addr = sock.recvfrom(1024)
-            # 当收到第一个包时，记录客户端地址，以便开始视频推流
-            if client_address_ref['addr'] is None:
-                print(f"[Control] 收到来自 {addr} 的连接请求，准备推流。")
-                client_address_ref['addr'] = addr
+            client_info.update({'addr': addr, 'last_contact': time.time()})
+            message = json.loads(data.decode())
+            command = message.get("command")
 
-            # 解析客户端反馈的JSON数据
-            feedback = json.loads(data.decode())
-            if 'loss_rate' in feedback:
-                controller.update_strategy(feedback['loss_rate'])
-
-        except (ConnectionResetError, socket.error) as e:
-            print(f"[Control] 连接错误: {e}. 客户端可能已断开。")
-            client_address_ref['addr'] = None # 重置客户端地址，停止推流
-        except json.JSONDecodeError:
-            print("[Control] 收到无法解析的控制信令。")
+            if command == "get_list":
+                sock.sendto(json.dumps(["camera"] + video_list).encode(), addr)
+            elif command == "play":
+                manager.start_stream(message.get("source"), addr)
+            elif command == "stop":
+                manager.stop_stream()
+            elif 'loss_rate' in message:
+                manager.controller.update_strategy(message['loss_rate'])
         except Exception as e:
-            print(f"[Control] 处理控制信令时发生未知错误: {e}")
+            print(f"[服务端-控制] 错误: {e}")
 
-# --- 3. 前向纠错 (FEC) 生成 ---
-def generate_fec_packets(data_packets: list) -> list:
-    """
-    为一组数据包生成FEC冗余包。
-    使用简单的异或（XOR）方式生成。
-    """
-    fec_packets = []
-    for i in range(0, len(data_packets), FEC_GROUP_SIZE):
-        group = data_packets[i:i+FEC_GROUP_SIZE]
-        if not group:
-            continue
 
-        # 确保组内所有包长度一致，便于异或操作
-        max_len = max(len(p) for p in group)
-        padded_group = [p.ljust(max_len, b'\0') for p in group]
-
-        # 异或生成FEC数据
-        fec_packet_data = bytearray(max_len)
-        for p in padded_group:
-            for j in range(max_len):
-                fec_packet_data[j] ^= p[j]
-
-        # 构建FEC包的头部
-        # 包含：帧ID, FEC组内索引, is_fec=1等信息
-        frame_id = int.from_bytes(data_packets[i][:4], 'big')
-        fec_group_index = i // FEC_GROUP_SIZE
-        header = frame_id.to_bytes(4, 'big') + \
-                 fec_group_index.to_bytes(2, 'big') + \
-                 (len(data_packets) // FEC_GROUP_SIZE).to_bytes(2, 'big') + \
-                 (1).to_bytes(1, 'big') # 标记为FEC包
-
-        fec_packets.append(header + fec_packet_data[9:]) # 替换头部
-    return fec_packets
-
-# --- 4. 音频推流线程 ---
-def audio_streamer(audio_sock, client_address_ref):
-    """
-    捕获麦克风音频并将其推流到客户端。
-    """
-    p = pyaudio.PyAudio()
+# --- 推流实现 (修复文件推流的音频分包逻辑) ---
+def stream_from_camera(video_sock, audio_sock, controller, running_flag, client_addr):
+    print("[服务端-推流] 摄像头推流激活。")
+    p_audio = pyaudio.PyAudio()
     try:
-        audio_stream = p.open(format=AUDIO_FORMAT,
-                              channels=AUDIO_CHANNELS,
-                              rate=AUDIO_RATE,
-                              input=True,
-                              frames_per_buffer=AUDIO_CHUNK)
+        audio_stream = p_audio.open(format=AUDIO_FORMAT, channels=AUDIO_CHANNELS,
+                                    rate=AUDIO_RATE, input=True,
+                                    frames_per_buffer=AUDIO_CHUNK)
     except Exception as e:
-        print(f"[Audio] 无法打开音频设备: {e}")
-        print("[Audio] 请确保已安装PyAudio并且有可用的麦克风。")
+        print(f"[服务端-音频] 致命错误: 无法打开麦克风: {e}")
+        p_audio.terminate()
         return
 
-    print("[Audio] 音频推流已启动...")
-    while True:
-        if client_address_ref['addr']:
+    def audio_thread_func():
+        print("[服务端-音频] 音频捕获线程已启动。")
+        sequence_number = 0
+        while running_flag.get('running'):
             try:
-                data = audio_stream.read(AUDIO_CHUNK)
-                audio_sock.sendto(data, (client_address_ref['addr'][0], AUDIO_PORT))
+                audio_data = audio_stream.read(AUDIO_CHUNK, exception_on_overflow=False)
+                header = sequence_number.to_bytes(8, 'big')
+                audio_sock.sendto(header + audio_data, (client_addr[0], AUDIO_PORT))
+                sequence_number = (sequence_number + 1) % (2**64)
             except IOError as e:
-                # 通常发生在音频设备改变或出现问题时
-                print(f"[Audio] 读取音频流时出错: {e}")
+                print(f"[服务端-音频] 音频捕获IO错误: {e}")
                 break
-            except socket.error:
-                # 客户端断开连接
-                print("[Audio] 客户端连接已断开，停止音频推流。")
-                break
-        else:
-            time.sleep(0.1) # 等待客户端连接
+        print("[服务端-音频] 音频捕获线程停止。")
 
-    audio_stream.stop_stream()
-    audio_stream.close()
-    p.terminate()
-    print("[Audio] 音频推流已停止。")
+    threading.Thread(target=audio_thread_func, daemon=True).start()
 
-# --- 5. 主函数：视频捕获与推流 ---
-def main():
-    # 初始化UDP套接字
-    video_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    audio_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    control_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    control_sock.bind((SERVER_HOST, CONTROL_PORT))
-
-    # 初始化自适应控制器和客户端地址引用
-    controller = AdaptiveStreamController()
-    client_address_ref = {'addr': None} # 在线程间共享客户端地址
-
-    # 启动控制信道监听线程
-    control_thread = threading.Thread(
-        target=control_channel_handler,
-        args=(control_sock, controller, client_address_ref),
-        daemon=True
-    )
-    control_thread.start()
-
-    # 启动音频推流线程
-    audio_thread = threading.Thread(
-        target=audio_streamer,
-        args=(audio_sock, client_address_ref),
-        daemon=True
-    )
-    audio_thread.start()
-
-    print(f"[Server] 服务器已启动。在 {SERVER_HOST}:{CONTROL_PORT} 等待客户端连接...")
-
-    # 初始化视频捕获
-    cap = cv2.VideoCapture(0) # 可替换为视频文件路径
+    cap = cv2.VideoCapture(0)
     if not cap.isOpened():
-        print("错误: 无法打开摄像头或视频文件。")
-        return
+        print("[服务端-视频] 无法打开摄像头。")
+        running_flag['running'] = False
 
     frame_id = 0
-    while True:
-        # 只有在确认客户端地址后才开始推流
-        if not client_address_ref['addr']:
-            time.sleep(0.5)
-            continue
-
-        client_addr = client_address_ref['addr']
-        strategy = controller.get_current_strategy()
-        start_time = time.time()
-
-        # 读取和处理视频帧
+    while running_flag.get('running') and cap.isOpened():
         ret, frame = cap.read()
-        if not ret:
-            print("视频流结束。")
-            break
+        if not ret: break
 
-        # 根据当前策略调整分辨率和JPEG质量
+        strategy = controller.get_current_strategy()
         frame = cv2.resize(frame, strategy["resolution"])
-        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), strategy["jpeg_quality"]]
-        _, encoded_frame = cv2.imencode('.jpg', frame, encode_param)
+        _, encoded_frame = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), strategy["jpeg_quality"]])
         frame_data = encoded_frame.tobytes()
 
-        # 将帧数据分片打包
-        packets = []
         total_packets = (len(frame_data) + PACKET_SIZE - 1) // PACKET_SIZE
         for i in range(total_packets):
-            chunk = frame_data[i*PACKET_SIZE : (i+1)*PACKET_SIZE]
-            # 构建数据包头部: 帧ID, 包索引, 总包数, is_fec=0
-            header = frame_id.to_bytes(4, 'big') + \
-                     i.to_bytes(2, 'big') + \
-                     total_packets.to_bytes(2, 'big') + \
-                     (0).to_bytes(1, 'big') # 标记为数据包
-            packets.append(header + chunk)
+            chunk = frame_data[i * PACKET_SIZE: (i + 1) * PACKET_SIZE]
+            header = frame_id.to_bytes(4, 'big') + i.to_bytes(2, 'big') + total_packets.to_bytes(2, 'big')
+            video_sock.sendto(header + chunk, (client_addr[0], VIDEO_PORT))
 
-        # 如果策略启用FEC，则生成并添加FEC包
-        if strategy["fec_enabled"]:
-            fec_packets = generate_fec_packets(packets)
-            packets.extend(fec_packets)
+        frame_id = (frame_id + 1) % (2 ** 32 - 1)
+        time.sleep(1 / strategy["fps_limit"])
 
-        # 发送所有包
-        for packet in packets:
-            video_sock.sendto(packet, (client_addr[0], VIDEO_PORT))
+    running_flag['running'] = False
+    if audio_stream.is_active(): audio_stream.stop_stream()
+    audio_stream.close()
+    p_audio.terminate()
+    if cap.isOpened(): cap.release()
+    print("[服务端-推流] 摄像头推流结束。")
 
-        frame_id = (frame_id + 1) % (2**32 - 1) # 帧ID循环
 
-        # 根据策略限制帧率
-        elapsed = time.time() - start_time
-        sleep_duration = max(0, (1.0 / strategy["fps_limit"]) - elapsed)
-        time.sleep(sleep_duration)
+def stream_from_file(video_sock, audio_sock, controller, running_flag, client_addr, video_path):
+    try:
+        container = av.open(video_path)
+    except Exception as e:
+        print(f"错误: 无法打开视频文件 {video_path} - {e}")
+        return
 
-    # 清理资源
-    cap.release()
-    video_sock.close()
-    audio_sock.close()
-    control_sock.close()
-    print("[Server] 服务器已关闭。")
+    video_stream = next((s for s in container.streams if s.type == 'video'), None)
+    audio_stream = next((s for s in container.streams if s.type == 'audio'), None)
+
+    if not video_stream:
+        print(f"错误: {video_path} 中没有视频流。")
+        container.close()
+        return
+
+    print(f"[服务端-推流] 开始推流文件: {video_path}")
+    start_time = time.time()
+    frame_id = 0
+    audio_sequence_number = 0
+
+    streams_to_demux = [s for s in [video_stream, audio_stream] if s]
+
+    resampler = None
+    if audio_stream:
+        print(f"[服务端-音频] 文件包含音频流。将重采样至 {AUDIO_RATE}Hz, 16-bit Mono。")
+        resampler = av.audio.resampler.AudioResampler(format='s16', layout='mono', rate=AUDIO_RATE)
+    else:
+        print(f"[服务端-音频] [警告] {video_path} 中没有音频流。")
+
+    # ### 核心修复：引入一个缓冲区来存储未发送完的音频数据 ###
+    audio_buffer = b''
+    # 每个样本是16位(2字节)，单声道
+    chunk_byte_size = AUDIO_CHUNK * 2 * AUDIO_CHANNELS
+
+    for packet in container.demux(streams_to_demux):
+        if not running_flag.get('running'): break
+        if packet.dts is None: continue
+
+        current_pts = float(packet.pts * packet.time_base)
+        elapsed_time = time.time() - start_time
+        if current_pts > elapsed_time:
+            time.sleep(max(0, current_pts - elapsed_time))
+
+        for frame in packet.decode():
+            if not running_flag.get('running'): break
+            if packet.stream.type == 'video':
+                img = frame.to_image()
+                strategy = controller.get_current_strategy()
+                img = img.resize(strategy["resolution"])
+                buffer = io.BytesIO()
+                img.save(buffer, format="JPEG", quality=strategy["jpeg_quality"])
+                frame_data = buffer.getvalue()
+
+                total_packets = (len(frame_data) + PACKET_SIZE - 1) // PACKET_SIZE
+                for i in range(total_packets):
+                    chunk = frame_data[i * PACKET_SIZE:(i + 1) * PACKET_SIZE]
+                    header = frame_id.to_bytes(4, 'big') + i.to_bytes(2, 'big') + total_packets.to_bytes(2, 'big')
+                    video_sock.sendto(header + chunk, (client_addr[0], VIDEO_PORT))
+                frame_id = (frame_id + 1) % (2 ** 32 - 1)
+
+            elif packet.stream.type == 'audio' and resampler:
+                resampled_frames = resampler.resample(frame)
+                for resampled_frame in resampled_frames:
+                    # 将新解码的数据加入缓冲区
+                    audio_buffer += resampled_frame.to_ndarray().tobytes()
+
+                    # ### 核心修复：循环切分缓冲区，发送固定大小的块 ###
+                    while len(audio_buffer) >= chunk_byte_size:
+                        # 从缓冲区头部取出一个标准大小的块
+                        audio_chunk_to_send = audio_buffer[:chunk_byte_size]
+                        # 更新缓冲区，移除已取出的部分
+                        audio_buffer = audio_buffer[chunk_byte_size:]
+
+                        # 发送这个标准大小的块
+                        header = audio_sequence_number.to_bytes(8, 'big')
+                        audio_sock.sendto(header + audio_chunk_to_send, (client_addr[0], AUDIO_PORT))
+                        audio_sequence_number = (audio_sequence_number + 1) % (2**64)
+
+    container.close()
+    print(f"[服务端-推流] 文件 {video_path} 推流结束。")
+
+
+# --- 主函数 (无变化) ---
+def main():
+    sockets = {
+        'video': socket.socket(socket.AF_INET, socket.SOCK_DGRAM),
+        'audio': socket.socket(socket.AF_INET, socket.SOCK_DGRAM),
+        'control': socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    }
+    sockets['control'].bind((SERVER_HOST, CONTROL_PORT))
+
+    controller = AdaptiveStreamController()
+    manager = StreamerManager(sockets['video'], sockets['audio'], controller)
+
+    control_thread = threading.Thread(target=control_channel_handler, args=(sockets['control'], manager), daemon=True)
+    control_thread.start()
+
+    print(f"[服务端] 服务器已启动于 {SERVER_HOST}:{CONTROL_PORT}。按 Ctrl+C 关闭。")
+    try:
+        control_thread.join()
+    except KeyboardInterrupt:
+        print("\n[服务端] 关闭中...")
+    finally:
+        manager.stop_stream()
+        for sock in sockets.values():
+            sock.close()
+        print("[服务端] 服务器已关闭。")
+
 
 if __name__ == "__main__":
     main()
