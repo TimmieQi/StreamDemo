@@ -9,7 +9,7 @@ import json
 import os
 import av
 import pyaudio
-import numpy as np # 需要 numpy 来进行数据切片
+import numpy as np
 
 from shared_config import *
 
@@ -136,9 +136,10 @@ def control_channel_handler(sock, manager):
             print(f"[服务端-控制] 错误: {e}")
 
 
-# --- 推流实现 (修复文件推流的音频分包逻辑) ---
+# --- 推流实现 (为数据包增加PTS) ---
 def stream_from_camera(video_sock, audio_sock, controller, running_flag, client_addr):
     print("[服务端-推流] 摄像头推流激活。")
+    start_time = time.time() # 摄像头直播的起始时间，作为PTS的基准
     p_audio = pyaudio.PyAudio()
     try:
         audio_stream = p_audio.open(format=AUDIO_FORMAT, channels=AUDIO_CHANNELS,
@@ -149,13 +150,16 @@ def stream_from_camera(video_sock, audio_sock, controller, running_flag, client_
         p_audio.terminate()
         return
 
-    def audio_thread_func():
+    def audio_thread_func(stream_start_time):
         print("[服务端-音频] 音频捕获线程已启动。")
         sequence_number = 0
         while running_flag.get('running'):
             try:
+                # ### 修改：为音频包增加PTS ###
+                pts_ms = int((time.time() - stream_start_time) * 1000)
                 audio_data = audio_stream.read(AUDIO_CHUNK, exception_on_overflow=False)
-                header = sequence_number.to_bytes(8, 'big')
+                # 新头部: 序列号(8字节) + PTS(8字节)
+                header = sequence_number.to_bytes(8, 'big') + pts_ms.to_bytes(8, 'big')
                 audio_sock.sendto(header + audio_data, (client_addr[0], AUDIO_PORT))
                 sequence_number = (sequence_number + 1) % (2**64)
             except IOError as e:
@@ -163,7 +167,7 @@ def stream_from_camera(video_sock, audio_sock, controller, running_flag, client_
                 break
         print("[服务端-音频] 音频捕获线程停止。")
 
-    threading.Thread(target=audio_thread_func, daemon=True).start()
+    threading.Thread(target=audio_thread_func, args=(start_time,), daemon=True).start()
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
@@ -181,9 +185,13 @@ def stream_from_camera(video_sock, audio_sock, controller, running_flag, client_
         frame_data = encoded_frame.tobytes()
 
         total_packets = (len(frame_data) + PACKET_SIZE - 1) // PACKET_SIZE
+        # ### 修改：为视频包增加PTS ###
+        pts_ms = int((time.time() - start_time) * 1000)
         for i in range(total_packets):
             chunk = frame_data[i * PACKET_SIZE: (i + 1) * PACKET_SIZE]
-            header = frame_id.to_bytes(4, 'big') + i.to_bytes(2, 'big') + total_packets.to_bytes(2, 'big')
+            # 新头部: 帧ID(4) + PTS(8) + 包序号(2) + 总包数(2)
+            header = frame_id.to_bytes(4, 'big') + pts_ms.to_bytes(8, 'big') + \
+                     i.to_bytes(2, 'big') + total_packets.to_bytes(2, 'big')
             video_sock.sendto(header + chunk, (client_addr[0], VIDEO_PORT))
 
         frame_id = (frame_id + 1) % (2 ** 32 - 1)
@@ -226,9 +234,7 @@ def stream_from_file(video_sock, audio_sock, controller, running_flag, client_ad
     else:
         print(f"[服务端-音频] [警告] {video_path} 中没有音频流。")
 
-    # ### 核心修复：引入一个缓冲区来存储未发送完的音频数据 ###
     audio_buffer = b''
-    # 每个样本是16位(2字节)，单声道
     chunk_byte_size = AUDIO_CHUNK * 2 * AUDIO_CHANNELS
 
     for packet in container.demux(streams_to_demux):
@@ -239,6 +245,8 @@ def stream_from_file(video_sock, audio_sock, controller, running_flag, client_ad
         elapsed_time = time.time() - start_time
         if current_pts > elapsed_time:
             time.sleep(max(0, current_pts - elapsed_time))
+
+        pts_ms = int(current_pts * 1000)
 
         for frame in packet.decode():
             if not running_flag.get('running'): break
@@ -253,25 +261,25 @@ def stream_from_file(video_sock, audio_sock, controller, running_flag, client_ad
                 total_packets = (len(frame_data) + PACKET_SIZE - 1) // PACKET_SIZE
                 for i in range(total_packets):
                     chunk = frame_data[i * PACKET_SIZE:(i + 1) * PACKET_SIZE]
-                    header = frame_id.to_bytes(4, 'big') + i.to_bytes(2, 'big') + total_packets.to_bytes(2, 'big')
+                    # ### 修改：为视频包增加PTS ###
+                    # 新头部: 帧ID(4) + PTS(8) + 包序号(2) + 总包数(2)
+                    header = frame_id.to_bytes(4, 'big') + pts_ms.to_bytes(8, 'big') + \
+                             i.to_bytes(2, 'big') + total_packets.to_bytes(2, 'big')
                     video_sock.sendto(header + chunk, (client_addr[0], VIDEO_PORT))
                 frame_id = (frame_id + 1) % (2 ** 32 - 1)
 
             elif packet.stream.type == 'audio' and resampler:
                 resampled_frames = resampler.resample(frame)
                 for resampled_frame in resampled_frames:
-                    # 将新解码的数据加入缓冲区
                     audio_buffer += resampled_frame.to_ndarray().tobytes()
 
-                    # ### 核心修复：循环切分缓冲区，发送固定大小的块 ###
                     while len(audio_buffer) >= chunk_byte_size:
-                        # 从缓冲区头部取出一个标准大小的块
                         audio_chunk_to_send = audio_buffer[:chunk_byte_size]
-                        # 更新缓冲区，移除已取出的部分
                         audio_buffer = audio_buffer[chunk_byte_size:]
 
-                        # 发送这个标准大小的块
-                        header = audio_sequence_number.to_bytes(8, 'big')
+                        # ### 修改：为音频包增加PTS ###
+                        # 新头部: 序列号(8字节) + PTS(8字节)
+                        header = audio_sequence_number.to_bytes(8, 'big') + pts_ms.to_bytes(8, 'big')
                         audio_sock.sendto(header + audio_chunk_to_send, (client_addr[0], AUDIO_PORT))
                         audio_sequence_number = (audio_sequence_number + 1) % (2**64)
 
