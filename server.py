@@ -1,4 +1,4 @@
-# server.py (修复摄像头推流版)
+# server.py (修复 to_bytes 错误版)
 
 import io
 import cv2
@@ -10,7 +10,7 @@ import os
 import av
 import pyaudio
 import numpy as np
-import struct  # 用于打包浮点数PTS
+import struct
 
 from shared_config import *
 
@@ -24,25 +24,13 @@ def get_video_files(path="videos"):
     return [f for f in os.listdir(path) if f.endswith(supported_formats)]
 
 
-# --- 自适应流控器  ---
+# --- 自适应流控器 (无变化) ---
 class AdaptiveStreamController:
     def __init__(self):
         self.configs = {
-            "good": {
-                "resolution": (640, 480),
-                "jpeg_quality": 85,
-                "fps_limit": 30
-            },
-            "medium": {
-                "resolution": (480, 360),
-                "jpeg_quality": 60,
-                "fps_limit": 20
-            },
-            "poor": {
-                "resolution": (320, 240),
-                "jpeg_quality": 40,
-                "fps_limit": 15
-            }
+            "good": {"resolution": (640, 480), "jpeg_quality": 85, "fps_limit": 30},
+            "medium": {"resolution": (480, 360), "jpeg_quality": 60, "fps_limit": 20},
+            "poor": {"resolution": (320, 240), "jpeg_quality": 40, "fps_limit": 15}
         }
         self.current_strategy_name = "good"
         self.lock = threading.Lock()
@@ -168,13 +156,12 @@ def control_channel_handler(sock, manager):
             print(f"[服务端-控制] 错误: {e}")
 
 
-# --- 推流实现 (修复摄像头推流) ---
+# --- 推流实现 (修复 to_bytes) ---
 def stream_from_camera(video_sock, audio_sock, controller, stream_control, client_addr):
     print("[服务端-推流] 摄像头推流激活。")
     start_time = time.time()
-
-    # 音频线程
     p_audio = pyaudio.PyAudio()
+
     try:
         audio_stream = p_audio.open(
             format=AUDIO_FORMAT,
@@ -192,15 +179,14 @@ def stream_from_camera(video_sock, audio_sock, controller, stream_control, clien
         sequence_number = 0
         while stream_control.get('running'):
             try:
-                # 对于直播，PTS就是从开始到现在的流逝时间（毫秒）
                 pts_ms = int((time.time() - stream_start_time) * 1000)
                 audio_data = audio_stream.read(AUDIO_CHUNK, exception_on_overflow=False)
-                # 头部: seq_num(8) + PTS(8) = 16 bytes
-                header = sequence_number.to_bytes(8, 'big') + pts_ms.to_bytes(8, 'big')
+                # ### 关键修复：增加 signed=True ###
+                header = sequence_number.to_bytes(8, 'big') + pts_ms.to_bytes(8, 'big', signed=True)
                 audio_sock.sendto(header + audio_data, (client_addr[0], AUDIO_PORT))
                 sequence_number = (sequence_number + 1) % (2**64)
             except IOError:
-                break  # 当主线程关闭流时会发生
+                break
 
         audio_stream.stop_stream()
         audio_stream.close()
@@ -210,7 +196,6 @@ def stream_from_camera(video_sock, audio_sock, controller, stream_control, clien
     audio_thread = threading.Thread(target=audio_thread_func, args=(start_time,), daemon=True)
     audio_thread.start()
 
-    # 视频处理
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("[服务端-视频] 无法打开摄像头。")
@@ -218,33 +203,28 @@ def stream_from_camera(video_sock, audio_sock, controller, stream_control, clien
         return
 
     frame_id = 0
-    # ### 关键修复：恢复视频捕获和发送的循环 ###
     while stream_control.get('running') and cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
 
-        # 对于直播，PTS就是从开始到现在的流逝时间（毫秒）
         pts_ms = int((time.time() - start_time) * 1000)
-
         strategy = controller.get_current_strategy()
         frame = cv2.resize(frame, strategy["resolution"])
         _, encoded_frame = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), strategy["jpeg_quality"]])
         frame_data = encoded_frame.tobytes()
-
         total_packets = (len(frame_data) + PACKET_SIZE - 1) // PACKET_SIZE
+
         for i in range(total_packets):
             chunk = frame_data[i * PACKET_SIZE:(i + 1) * PACKET_SIZE]
-            # 新头部: frame_id(4) + PTS(8) + packet_idx(2) + total_pkts(2) = 16 bytes
-            header = (frame_id.to_bytes(4, 'big') + pts_ms.to_bytes(8, 'big') +
-                      i.to_bytes(2, 'big') + total_packets.to_bytes(2, 'big'))
+            # ### 关键修复：增加 signed=True ###
+            header = frame_id.to_bytes(4, 'big') + pts_ms.to_bytes(8, 'big', signed=True) + \
+                     i.to_bytes(2, 'big') + total_packets.to_bytes(2, 'big')
             video_sock.sendto(header + chunk, (client_addr[0], VIDEO_PORT))
 
         frame_id = (frame_id + 1) % (2 ** 32 - 1)
-        # 通过FPS限制来控制发送速率，避免网络拥塞
         time.sleep(1 / strategy["fps_limit"])
 
-    # 清理
     if cap.isOpened():
         cap.release()
     print("[服务端-推流] 摄像头推流结束。")
@@ -259,6 +239,7 @@ def stream_from_file(video_sock, audio_sock, controller, stream_control, client_
 
     video_stream = next((s for s in container.streams if s.type == 'video'), None)
     audio_stream = next((s for s in container.streams if s.type == 'audio'), None)
+
     if not video_stream:
         print(f"错误: {video_path} 中没有视频流。")
         container.close()
@@ -294,6 +275,7 @@ def stream_from_file(video_sock, audio_sock, controller, stream_control, client_
 
         current_pts_sec = float(packet.pts * packet.time_base)
         elapsed_time = time.time() - start_time
+
         if current_pts_sec > elapsed_time:
             time.sleep(max(0, current_pts_sec - elapsed_time))
 
@@ -310,23 +292,27 @@ def stream_from_file(video_sock, audio_sock, controller, stream_control, client_
                 buffer = io.BytesIO()
                 img.save(buffer, format="JPEG", quality=strategy["jpeg_quality"])
                 frame_data = buffer.getvalue()
-
                 total_packets = (len(frame_data) + PACKET_SIZE - 1) // PACKET_SIZE
+
                 for i in range(total_packets):
                     chunk = frame_data[i * PACKET_SIZE:(i + 1) * PACKET_SIZE]
-                    header = (frame_id.to_bytes(4, 'big') + pts_ms.to_bytes(8, 'big') +
-                              i.to_bytes(2, 'big') + total_packets.to_bytes(2, 'big'))
+                    # ### 关键修复：增加 signed=True ###
+                    header = frame_id.to_bytes(4, 'big') + pts_ms.to_bytes(8, 'big', signed=True) + \
+                             i.to_bytes(2, 'big') + total_packets.to_bytes(2, 'big')
                     video_sock.sendto(header + chunk, (client_addr[0], VIDEO_PORT))
 
                 frame_id = (frame_id + 1) % (2 ** 32 - 1)
+
             elif packet.stream.type == 'audio' and resampler:
                 resampled_frames = resampler.resample(frame)
                 for resampled_frame in resampled_frames:
                     audio_buffer += resampled_frame.to_ndarray().tobytes()
+
                     while len(audio_buffer) >= chunk_byte_size:
                         audio_chunk_to_send = audio_buffer[:chunk_byte_size]
                         audio_buffer = audio_buffer[chunk_byte_size:]
-                        header = audio_sequence_number.to_bytes(8, 'big') + pts_ms.to_bytes(8, 'big')
+                        # ### 关键修复：增加 signed=True ###
+                        header = audio_sequence_number.to_bytes(8, 'big') + pts_ms.to_bytes(8, 'big', signed=True)
                         audio_sock.sendto(header + audio_chunk_to_send, (client_addr[0], AUDIO_PORT))
                         audio_sequence_number = (audio_sequence_number + 1) % (2**64)
 
@@ -341,8 +327,8 @@ def main():
         'audio': socket.socket(socket.AF_INET, socket.SOCK_DGRAM),
         'control': socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     }
-    sockets['control'].bind((SERVER_HOST, CONTROL_PORT))
 
+    sockets['control'].bind((SERVER_HOST, CONTROL_PORT))
     controller = AdaptiveStreamController()
     manager = StreamerManager(sockets['video'], sockets['audio'], controller)
 
@@ -363,6 +349,7 @@ def main():
         manager.stop_stream()
         [sock.close() for sock in sockets.values()]
         print("[服务端] 服务器已关闭。")
+
 
 if __name__ == "__main__":
     main()

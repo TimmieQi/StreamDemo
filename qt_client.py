@@ -1,4 +1,4 @@
-# qt_client.py (最终优化版)
+# qt_client.py (修复 UnboundLocalError 和代码格式)
 
 import sys
 import cv2
@@ -12,19 +12,19 @@ import heapq
 import pyaudio
 
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QListWidget, QPushButton, QLineEdit, QStatusBar,
-    QMenu, QSlider, QComboBox, QSizePolicy, QStyle
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QListWidget,
+    QPushButton, QLineEdit, QStatusBar, QMenu, QSlider, QComboBox, QSizePolicy, QStyle
 )
 from PySide6.QtGui import QImage, QPixmap, QAction
 from PySide6.QtCore import Qt, QTimer, Signal, QObject
 
 from shared_config import *
 
-# 用于在非UI线程和UI线程间通信的信号对象
+
 class WorkerSignals(QObject):
     play_info_received = Signal(dict)
     play_failed = Signal(str)
+
 
 class MasterClock:
     def __init__(self):
@@ -45,7 +45,6 @@ class MasterClock:
         with self._lock:
             if self._start_time == -1 and pts_ms is not None:
                 self._start_pts_ms = pts_ms
-                # 关键修复：补偿音频输出延迟
                 self._start_time = time.time() - audio_latency_sec
                 print(f"[时钟] 主时钟启动。初始PTS: {pts_ms}ms, 音频延迟补偿: {audio_latency_sec*1000:.2f}ms")
 
@@ -56,7 +55,6 @@ class MasterClock:
             if self.is_paused:
                 elapsed_before_pause = self._paused_at_time - self._start_time
                 return self._start_pts_ms + int(elapsed_before_pause * 1000 * self._rate)
-
             elapsed = time.time() - self._start_time
             return self._start_pts_ms + int(elapsed * 1000 * self._rate)
 
@@ -75,55 +73,89 @@ class MasterClock:
     def set_rate(self, rate):
         self._rate = 1.0
 
+
 class NetworkMonitor:
     def __init__(self):
         self.reset()
+
     def reset(self):
         self.lock = threading.Lock()
-        self.received_packets, self.lost_packets, self.expected_frame_id = 0, 0, -1
+        self.received_packets = 0
+        self.lost_packets = 0
+        self.expected_frame_id = -1
+
     def record_packet(self, frame_id):
         with self.lock:
-            if self.expected_frame_id == -1: self.expected_frame_id = frame_id
-            if frame_id > self.expected_frame_id: self.lost_packets += frame_id - self.expected_frame_id
-            self.expected_frame_id = frame_id + 1; self.received_packets += 1
+            if self.expected_frame_id == -1:
+                self.expected_frame_id = frame_id
+            if frame_id > self.expected_frame_id:
+                self.lost_packets += frame_id - self.expected_frame_id
+            self.expected_frame_id = frame_id + 1
+            self.received_packets += 1
+
     def get_statistics(self):
         with self.lock:
             total = self.received_packets + self.lost_packets
             loss_rate = self.lost_packets / total if total > 0 else 0.0
-            self.received_packets, self.lost_packets = 0, 0
+            self.received_packets = 0
+            self.lost_packets = 0
             return {"loss_rate": loss_rate}
+
 
 class VideoJitterBuffer:
     def __init__(self):
         self.reset()
+
     def reset(self):
         self.lock = threading.Lock()
         self.packet_buffers = defaultdict(lambda: {"packets": {}, "total_packets": -1, "pts": -1})
         self.ready_queue = deque()
         self.last_played_pts = -1
+
     def add_packet(self, packet: bytes, monitor: NetworkMonitor):
-        if len(packet) < 16: return
-        frame_id, pts_ms, p_idx, total_p = int.from_bytes(packet[0:4], 'big'), int.from_bytes(packet[4:12], 'big'), int.from_bytes(packet[12:14], 'big'), int.from_bytes(packet[14:16], 'big')
+        if len(packet) < 16:
+            return
+
+        frame_id = int.from_bytes(packet[0:4], 'big')
+        pts_ms = int.from_bytes(packet[4:12], 'big', signed=True)
+        p_idx = int.from_bytes(packet[12:14], 'big')
+        total_p = int.from_bytes(packet[14:16], 'big')
+
         with self.lock:
-            if self.last_played_pts != -1 and pts_ms < self.last_played_pts: return
-            if p_idx in self.packet_buffers[frame_id]["packets"]: return
-            if not self.packet_buffers[frame_id]["packets"]: monitor.record_packet(frame_id)
+            if self.last_played_pts != -1 and pts_ms < self.last_played_pts:
+                return
+            if p_idx in self.packet_buffers[frame_id]["packets"]:
+                return
+            if not self.packet_buffers[frame_id]["packets"]:
+                monitor.record_packet(frame_id)
+
             buffer = self.packet_buffers[frame_id]
-            buffer["packets"][p_idx], buffer["total_packets"], buffer["pts"] = packet[16:], total_p, pts_ms
-            if len(buffer["packets"]) == buffer["total_packets"]: self._push_to_ready_queue(frame_id)
+            buffer["packets"][p_idx] = packet[16:]
+            buffer["total_packets"] = total_p
+            buffer["pts"] = pts_ms
+
+            if len(buffer["packets"]) == buffer["total_packets"]:
+                self._push_to_ready_queue(frame_id)
+
     def _push_to_ready_queue(self, frame_id):
         buffer = self.packet_buffers.pop(frame_id)
         data = b"".join(buffer["packets"][i] for i in sorted(buffer["packets"]))
         self.ready_queue.append((buffer["pts"], data))
         self.ready_queue = deque(sorted(self.ready_queue))
+
     def get_frame(self, target_pts_ms):
         with self.lock:
-            if not self.ready_queue or target_pts_ms == -1: return None
+            if not self.ready_queue or target_pts_ms == -1:
+                return None
+
             best_frame = None
             for i in range(len(self.ready_queue)):
                 pts, data = self.ready_queue[i]
-                if pts <= target_pts_ms: best_frame = (pts, data)
-                else: break
+                if pts <= target_pts_ms:
+                    best_frame = (pts, data)
+                else:
+                    break
+
             if best_frame:
                 self.last_played_pts = best_frame[0]
                 while self.ready_queue and self.ready_queue[0][0] <= self.last_played_pts:
@@ -131,25 +163,37 @@ class VideoJitterBuffer:
                 return best_frame[1]
             return None
 
+
 class AudioJitterBuffer:
     def __init__(self, max_size=200):
         self.max_size = max_size
         self.silence = b'\x00' * (AUDIO_CHUNK * 2 * AUDIO_CHANNELS)
         self.reset()
+
     def reset(self):
         self.lock = threading.Lock()
         self.buffer = []
         self.expected_seq = -1
+
     def add_chunk(self, chunk):
-        if len(chunk) < 16: return
-        seq, pts_ms, payload = int.from_bytes(chunk[0:8], 'big'), int.from_bytes(chunk[8:16], 'big'), chunk[16:]
+        if len(chunk) < 16:
+            return
+
+        seq = int.from_bytes(chunk[0:8], 'big')
+        pts_ms = int.from_bytes(chunk[8:16], 'big', signed=True)
+        payload = chunk[16:]
+
         with self.lock:
-            if self.expected_seq == -1: self.expected_seq = seq
+            if self.expected_seq == -1:
+                self.expected_seq = seq
             if seq >= self.expected_seq and len(self.buffer) < self.max_size:
                 heapq.heappush(self.buffer, (seq, pts_ms, payload))
+
     def get_chunk(self):
         with self.lock:
-            if not self.buffer: return None, None
+            if not self.buffer:
+                return None, None
+
             seq, pts_ms, payload = self.buffer[0]
             if seq == self.expected_seq:
                 heapq.heappop(self.buffer)
@@ -161,8 +205,10 @@ class AudioJitterBuffer:
             else:
                 self.expected_seq += 1
                 return None, self.silence
+
     def clear(self):
         self.reset()
+
 
 # --- 线程函数 ---
 def video_receiver_thread(sock, jitter_buffer, monitor, running_flag):
@@ -170,23 +216,27 @@ def video_receiver_thread(sock, jitter_buffer, monitor, running_flag):
         try:
             jitter_buffer.add_packet(sock.recvfrom(65535)[0], monitor)
         except (socket.timeout, socket.error):
-            if not running_flag.get('running'): break
+            if not running_flag.get('running'):
+                break
             continue
+
 
 def audio_receiver_thread(sock, audio_buffer, running_flag):
     while running_flag.get('running'):
         try:
             audio_buffer.add_chunk(sock.recvfrom(16 + AUDIO_CHUNK * 2)[0])
         except (socket.timeout, socket.error):
-            if not running_flag.get('running'): break
+            if not running_flag.get('running'):
+                break
             continue
+
 
 def audio_player_thread(audio_buffer, clock, state_vars, running_flag):
     p = pyaudio.PyAudio()
     stream = None
     try:
-        stream = p.open(format=pyaudio.paInt16, channels=AUDIO_CHANNELS, rate=AUDIO_RATE, output=True)
-
+        stream = p.open(format=pyaudio.paInt16, channels=AUDIO_CHANNELS,
+                        rate=AUDIO_RATE, output=True)
         while running_flag.get('running'):
             is_file_stream = state_vars.get('duration_sec', 0) > 0
             if is_file_stream and clock.is_paused:
@@ -203,10 +253,8 @@ def audio_player_thread(audio_buffer, clock, state_vars, running_flag):
                 time.sleep(0.005)
                 continue
 
-            # 关键修复：在第一次获取到数据时，用声卡延迟来启动时钟
             if clock.get_time_ms() == -1:
-                latency = stream.get_output_latency()
-                clock.start(pts_ms, latency)
+                clock.start(pts_ms, stream.get_output_latency())
 
             if state_vars['volume'] < 1.0:
                 samples = np.frombuffer(chunk, dtype=np.int16)
@@ -224,10 +272,12 @@ def audio_player_thread(audio_buffer, clock, state_vars, running_flag):
         p.terminate()
         print("[客户端-播放] 音频播放线程已停止。")
 
+
 def feedback_sender_thread(sock, server_addr, monitor, running_flag):
     while running_flag.get('running'):
         time.sleep(1)
-        if not running_flag.get('running'): break
+        if not running_flag.get('running'):
+            break
         try:
             stats = monitor.get_statistics()
             stats['command'] = 'heartbeat'
@@ -235,20 +285,31 @@ def feedback_sender_thread(sock, server_addr, monitor, running_flag):
         except socket.error:
             break
 
-# --- QT6主窗口类 ---
+
+# --- QT6主窗口类 (代码格式和UI更新逻辑修复) ---
 class VideoStreamClient(QMainWindow):
     def __init__(self):
         super().__init__()
         self.is_connected = False
         self.running_flag = {'running': False}
-        self.sockets, self.threads = {}, {}
-        self.server_address, self.current_source = None, "无"
-        self.scale_mode, self.last_frame = "fit", None
+        self.sockets = {}
+        self.threads = {}
+        self.server_address = None
+        self.current_source = "无"
+        self.scale_mode = "fit"
+        self.last_frame = None
 
-        self.PLAYER_STATE_STOPPED, self.PLAYER_STATE_LOADING, self.PLAYER_STATE_PLAYING = 0, 1, 2
+        self.PLAYER_STATE_STOPPED = 0
+        self.PLAYER_STATE_LOADING = 1
+        self.PLAYER_STATE_PLAYING = 2
         self.player_status = self.PLAYER_STATE_STOPPED
 
-        self.playback_state = { 'duration_sec': 0, 'volume': 1.0, 'rate': 1.0 }
+        self.playback_state = {
+            'duration_sec': 0,
+            'volume': 1.0,
+            'rate': 1.0
+        }
+
         self.monitor = NetworkMonitor()
         self.video_jitter_buffer = VideoJitterBuffer()
         self.audio_jitter_buffer = AudioJitterBuffer()
@@ -262,7 +323,7 @@ class VideoStreamClient(QMainWindow):
         self.start_ui_updater()
 
     def init_ui(self):
-        self.setWindowTitle("高级视频流客户端 (优化版)")
+        self.setWindowTitle("高级视频流客户端 (最终版)")
         self.setGeometry(100, 100, 1000, 800)
 
         main_widget = QWidget()
@@ -272,6 +333,8 @@ class VideoStreamClient(QMainWindow):
         # 左侧面板
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
+
+        # 连接组
         conn_group = QWidget()
         conn_layout = QHBoxLayout(conn_group)
         conn_layout.addWidget(QLabel("服务器IP:"))
@@ -281,9 +344,13 @@ class VideoStreamClient(QMainWindow):
         self.connect_btn.clicked.connect(self.toggle_connection)
         conn_layout.addWidget(self.connect_btn)
         left_layout.addWidget(conn_group)
+
+        # 视频列表
         self.video_list = QListWidget()
         left_layout.addWidget(QLabel("播放列表:"))
         left_layout.addWidget(self.video_list)
+
+        # 播放按钮
         self.play_btn = QPushButton("播放选中项")
         self.play_btn.setEnabled(False)
         self.play_btn.clicked.connect(self.play_selected)
@@ -292,32 +359,41 @@ class VideoStreamClient(QMainWindow):
         # 右侧面板
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
+
+        # 视频标签
         self.video_label = QLabel("请连接服务器并选择一个视频源")
         self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.video_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.video_label.setStyleSheet("background-color: black; color: white; font-size: 16px;")
         right_layout.addWidget(self.video_label, stretch=1)
 
-        # 控制条
+        # 控制部件
         controls_widget = QWidget()
         controls_layout = QVBoxLayout(controls_widget)
+
+        # 进度条
         self.progress_slider = QSlider(Qt.Horizontal)
         self.progress_slider.setEnabled(False)
         self.progress_slider.sliderMoved.connect(self.seek_slider_moved)
         self.progress_slider.sliderReleased.connect(self.seek_slider_released)
         controls_layout.addWidget(self.progress_slider)
 
+        # 底部控制栏
         bottom_bar = QHBoxLayout()
+
+        # 播放/暂停按钮
         self.play_pause_btn = QPushButton()
         self.play_pause_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
         self.play_pause_btn.setEnabled(False)
         self.play_pause_btn.clicked.connect(self.toggle_pause)
         bottom_bar.addWidget(self.play_pause_btn)
 
+        # 时间标签
         self.time_label = QLabel("00:00 / 00:00")
         bottom_bar.addWidget(self.time_label)
         bottom_bar.addStretch()
 
+        # 音量控制
         bottom_bar.addWidget(QLabel("音量:"))
         self.volume_slider = QSlider(Qt.Horizontal)
         self.volume_slider.setRange(0, 100)
@@ -326,35 +402,41 @@ class VideoStreamClient(QMainWindow):
         self.volume_slider.valueChanged.connect(self.change_volume)
         bottom_bar.addWidget(self.volume_slider)
 
+        # 速率控制
         bottom_bar.addWidget(QLabel("速率:"))
         self.speed_combo = QComboBox()
         self.speed_combo.addItems(["1.0x"])
         self.speed_combo.setCurrentIndex(0)
         self.speed_combo.setEnabled(False)
         bottom_bar.addWidget(self.speed_combo)
+
         controls_layout.addLayout(bottom_bar)
         right_layout.addWidget(controls_widget)
 
         main_layout.addWidget(left_panel, stretch=1)
         main_layout.addWidget(right_panel, stretch=3)
 
+        # 状态栏
         self.status_bar = QStatusBar()
         self.status_bar.showMessage("状态: 未连接")
         self.setStatusBar(self.status_bar)
 
+        # 右键菜单
         self.video_label.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.video_label.customContextMenuRequested.connect(self.show_context_menu)
 
     def start_ui_updater(self):
         self.ui_timer = QTimer(self)
         self.ui_timer.timeout.connect(self.update_ui_tick)
-        self.ui_timer.start(20) # 提高UI更新频率以获得更流畅的视频
+        self.ui_timer.start(20)
 
     def update_ui_tick(self):
+        # ### 关键修复：在函数开头就获取时钟时间 ###
+        now_ms = self.master_clock.get_time_ms()
+
         if self.player_status == self.PLAYER_STATE_PLAYING:
             is_file_stream = self.playback_state['duration_sec'] > 0
             if not (is_file_stream and self.master_clock.is_paused):
-                now_ms = self.master_clock.get_time_ms()
                 if now_ms != -1:
                     frame_data = self.video_jitter_buffer.get_frame(now_ms)
                     if frame_data:
@@ -364,7 +446,8 @@ class VideoStreamClient(QMainWindow):
                             if frame is not None:
                                 self.last_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                                 self.display_frame()
-                        except Exception: pass
+                        except Exception:
+                            pass
 
             if is_file_stream and now_ms != -1:
                 current_sec = now_ms / 1000.0
@@ -374,12 +457,21 @@ class VideoStreamClient(QMainWindow):
                 self.time_label.setText(f"{self.format_time(current_sec)} / {self.format_time(total_sec)}")
 
     def display_frame(self):
-        if self.last_frame is None or self.player_status != self.PLAYER_STATE_PLAYING: return
+        if self.last_frame is None or self.player_status != self.PLAYER_STATE_PLAYING:
+            return
+
         h, w, ch = self.last_frame.shape
         qImg = QImage(self.last_frame.data, w, h, ch * w, QImage.Format.Format_RGB888)
         pixmap = QPixmap.fromImage(qImg)
-        if self.scale_mode == "adapt": pixmap = pixmap.scaled(self.video_label.size(), Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
-        elif self.scale_mode != "original": pixmap = pixmap.scaled(self.video_label.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+
+        if self.scale_mode == "adapt":
+            pixmap = pixmap.scaled(self.video_label.size(),
+                                   Qt.AspectRatioMode.IgnoreAspectRatio,
+                                   Qt.TransformationMode.SmoothTransformation)
+        elif self.scale_mode != "original":
+            pixmap = pixmap.scaled(self.video_label.size(),
+                                   Qt.AspectRatioMode.KeepAspectRatio,
+                                   Qt.TransformationMode.SmoothTransformation)
         self.video_label.setPixmap(pixmap)
 
     def format_time(self, seconds):
@@ -387,8 +479,10 @@ class VideoStreamClient(QMainWindow):
         return f"{s // 60:02d}:{s % 60:02d}"
 
     def toggle_connection(self):
-        if self.is_connected: self.disconnect()
-        else: self.connect()
+        if self.is_connected:
+            self.disconnect()
+        else:
+            self.connect()
 
     def connect(self):
         server_ip = self.ip_entry.text()
@@ -398,11 +492,17 @@ class VideoStreamClient(QMainWindow):
 
         self.server_address = (server_ip, CONTROL_PORT)
         self.running_flag['running'] = True
+
         try:
-            self.sockets['control'] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self.sockets['video'] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self.sockets['audio'] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            for s in ['video', 'audio']: self.sockets[s].settimeout(1.0)
+            self.sockets = {
+                'control': socket.socket(socket.AF_INET, socket.SOCK_DGRAM),
+                'video': socket.socket(socket.AF_INET, socket.SOCK_DGRAM),
+                'audio': socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            }
+
+            for s in ['video', 'audio']:
+                self.sockets[s].settimeout(1.0)
+
             self.sockets['video'].bind(('', VIDEO_PORT))
             self.sockets['audio'].bind(('', AUDIO_PORT))
 
@@ -412,8 +512,7 @@ class VideoStreamClient(QMainWindow):
             self.sockets['control'].settimeout(None)
 
             self.video_list.clear()
-            for item in json.loads(data.decode()):
-                self.video_list.addItem(item)
+            [self.video_list.addItem(item) for item in json.loads(data.decode())]
 
             self.start_threads()
             self.is_connected = True
@@ -428,14 +527,17 @@ class VideoStreamClient(QMainWindow):
         if self.sockets.get('control') and self.server_address:
             try:
                 self.sockets['control'].sendto(json.dumps({"command": "stop"}).encode(), self.server_address)
-            except socket.error: pass
+            except socket.error:
+                pass
         self.cleanup()
 
     def cleanup(self):
         self.player_status = self.PLAYER_STATE_STOPPED
-        if not self.running_flag.get('running'): return
+        if not self.running_flag.get('running'):
+            return
 
         self.running_flag['running'] = False
+
         for thread in self.threads.values():
             if thread.is_alive():
                 thread.join(timeout=1.5)
@@ -459,8 +561,9 @@ class VideoStreamClient(QMainWindow):
             'video_recv': (video_receiver_thread, (self.sockets['video'], self.video_jitter_buffer, self.monitor, self.running_flag)),
             'audio_recv': (audio_receiver_thread, (self.sockets['audio'], self.audio_jitter_buffer, self.running_flag)),
             'audio_play': (audio_player_thread, (self.audio_jitter_buffer, self.master_clock, self.playback_state, self.running_flag)),
-            'feedback': (feedback_sender_thread, (self.sockets['control'], self.server_address, self.monitor, self.running_flag)),
+            'feedback': (feedback_sender_thread, (self.sockets['control'], self.server_address, self.monitor, self.running_flag))
         }
+
         for name, (target, args) in thread_map.items():
             self.threads[name] = threading.Thread(target=target, args=args, daemon=True)
             self.threads[name].start()
@@ -483,10 +586,15 @@ class VideoStreamClient(QMainWindow):
 
     def request_play_worker(self):
         try:
-            self.sockets['control'].sendto(json.dumps({"command": "play", "source": self.current_source}).encode(), self.server_address)
+            self.sockets['control'].sendto(
+                json.dumps({"command": "play", "source": self.current_source}).encode(),
+                self.server_address
+            )
+
             self.sockets['control'].settimeout(5.0)
             data, _ = self.sockets['control'].recvfrom(1024)
             self.sockets['control'].settimeout(None)
+
             response = json.loads(data.decode())
             if response.get("command") == "play_info":
                 self.worker_signals.play_info_received.emit(response)
@@ -520,11 +628,17 @@ class VideoStreamClient(QMainWindow):
             self.time_label.setText(f"{self.format_time(target_sec)} / {self.format_time(self.playback_state['duration_sec'])}")
 
     def seek_slider_released(self):
-        if self.playback_state['duration_sec'] == 0: return
+        if self.playback_state['duration_sec'] == 0:
+            return
+
         target_sec = self.playback_state['duration_sec'] * (self.progress_slider.value() / 1000.0)
         print(f"[客户端] 请求跳转到 {target_sec:.2f}s")
+
         try:
-            self.sockets['control'].sendto(json.dumps({"command": "seek", "time": target_sec}).encode(), self.server_address)
+            self.sockets['control'].sendto(
+                json.dumps({"command": "seek", "time": target_sec}).encode(),
+                self.server_address
+            )
             self.reset_playback_state()
             if self.master_clock.is_paused:
                 self.toggle_pause()
@@ -556,7 +670,7 @@ class VideoStreamClient(QMainWindow):
     def setup_ui_for_playback(self, is_file_stream):
         self.progress_slider.setEnabled(is_file_stream)
         self.play_pause_btn.setEnabled(is_file_stream)
-        self.speed_combo.setEnabled(False) # 变速功能在此版本中永久禁用
+        self.speed_combo.setEnabled(False)
 
         if is_file_stream:
             self.play_pause_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
@@ -569,21 +683,27 @@ class VideoStreamClient(QMainWindow):
 
     def show_context_menu(self, pos):
         menu = QMenu(self)
-        actions = {"自适应缩放 (Adapt)": "adapt", "按比例缩放 (Fit)": "fit", "原始大小 (Original)": "original"}
+        actions = {
+            "自适应缩放 (Adapt)": "adapt",
+            "按比例缩放 (Fit)": "fit",
+            "原始大小 (Original)": "original"
+        }
+
         for text, mode in actions.items():
             action = QAction(text, self, checkable=True, checked=(self.scale_mode == mode))
             action.triggered.connect(lambda checked, m=mode: self.set_scale_mode(m))
             menu.addAction(action)
+
         menu.exec(self.video_label.mapToGlobal(pos))
 
     def set_scale_mode(self, mode):
         self.scale_mode = mode
-        if self.last_frame is not None:
-            self.display_frame()
+        self.display_frame()
 
     def closeEvent(self, event):
         self.disconnect()
         event.accept()
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
