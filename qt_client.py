@@ -212,23 +212,67 @@ def video_decoder_thread(packet_buffer, frame_buffer, clock, running_flag):
         print(f"[客户端-解码] [致命错误] 无法创建解码器: {e}")
         return
 
+    # 用于缓存分片数据的字典 {timestamp: [payload_chunk1, payload_chunk2, ...]}
+    reassembly_buffer = {}
+
     while running_flag.get('running'):
         packet_data = packet_buffer.get_packet()
         if packet_data is None:
-            time.sleep(0.005) # Jitter buffer在等待包
+            time.sleep(0.005)  # Jitter buffer在等待包
+            continue
+
+        # 新协议解析: Header(7B) + Payload
+        if len(packet_data) < 7:
             continue
 
         ts = int.from_bytes(packet_data[2:6], 'big', signed=True)
-        payload = packet_data[6:]
+        frag_info = int.from_bytes(packet_data[6:7], 'big')
+        payload = packet_data[7:]
 
-        try:
-            av_packet = av.Packet(payload)
-            av_packet.pts = ts
-            for frame in decoder.decode(av_packet):
-                img = frame.to_ndarray(format='rgb24')
-                frame_buffer.add_frame((frame.pts, img))
-        except Exception:
-            pass
+        is_start = (frag_info & 0x80) != 0
+        is_end = (frag_info & 0x40) != 0
+
+        # ---- 帧重组逻辑 ----
+        full_frame_payload = None
+
+        if is_start and is_end:
+            # 完整包，未分片
+            full_frame_payload = payload
+        else:
+            # 分片包
+            if is_start:
+                # 新的一帧的开始，清空旧的（可能不完整的）数据并开始记录
+                reassembly_buffer[ts] = [payload]
+            elif ts in reassembly_buffer:
+                # 中间或结尾的包，追加数据
+                reassembly_buffer[ts].append(payload)
+
+            if is_end and ts in reassembly_buffer:
+                # 收到结尾，可以重组了
+                fragments = reassembly_buffer.pop(ts)
+                full_frame_payload = b''.join(fragments)
+        # ---- 帧重组逻辑结束 ----
+
+        if full_frame_payload:
+            try:
+                av_packet = av.Packet(full_frame_payload)
+                av_packet.pts = ts
+                for frame in decoder.decode(av_packet):
+                    img = frame.to_ndarray(format='rgb24')
+                    frame_buffer.add_frame((frame.pts, img))
+            except Exception as e:
+                # 打印解码错误有助于调试，但不要让它崩溃
+                # print(f"[客户端-解码] 解码TS={ts}时发生错误: {e}")
+                pass
+
+        # 清理过时的重组缓冲区条目，防止内存泄漏
+        # (如果一个分片帧的结尾丢失，它会永远留在缓冲区里)
+        # 简单策略：只保留最新的几个时间戳
+        if len(reassembly_buffer) > 10:
+            oldest_ts = min(reassembly_buffer.keys())
+            del reassembly_buffer[oldest_ts]
+
+
     print("[客户端-解码] 视频解码线程已停止。")
 
 

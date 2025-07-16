@@ -9,6 +9,9 @@ VIDEO_PORT = 9999      # 视频数据传输端口
 AUDIO_PORT = 9997      # 音频数据传输端口
 CONTROL_PORT = 9998    # 控制信令传输端口 (例如: 网络状态反馈)
 
+# [NEW] 自定义RTP头大小 (2B seq + 4B ts + 1B frag_info)
+VIDEO_HEADER_SIZE = 7
+
 # --- 视频流参数 ---
 VIDEO_CODEC = 'hevc'   # 视频编码器: hevc (H.265) 或 h264
 
