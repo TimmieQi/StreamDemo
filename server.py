@@ -30,9 +30,9 @@ def get_video_files(path="videos"):
 class AdaptiveStreamController:
     def __init__(self):
         self.configs = {
-            "good": {"multiplier": 1.0, "fps_limit": 30},
-            "medium": {"multiplier": 0.5, "fps_limit": 20},
-            "poor": {"multiplier": 0.25, "fps_limit": 15}
+            "good": {"multiplier": 1.0, "fps_limit": 60},
+            "medium": {"multiplier": 0.5, "fps_limit": 30},
+            "poor": {"multiplier": 0.25, "fps_limit": 20}
         }
         self.current_strategy_name = "good"
         self.lock = threading.Lock()
