@@ -570,6 +570,11 @@ class VideoStreamClient(QMainWindow):
 
         self.init_ui()
         self.start_ui_updater()
+        # Start the status update timer
+        self.status_update_timer = QTimer(self)
+        self.status_update_timer.setInterval(1000)  # 1 second
+        self.status_update_timer.timeout.connect(self._update_status_display)
+        self.status_update_timer.start()
 
     def init_ui(self):
         self.setWindowTitle("高级视频流客户端 (H.265版)")
@@ -606,6 +611,22 @@ class VideoStreamClient(QMainWindow):
         self.debug_btn = QPushButton("高级调试 (图表)")
         self.debug_btn.clicked.connect(self.show_debug_window)
         left_layout.addWidget(self.debug_btn)
+
+        # Network status indicator
+        self.latency_indicator_label = QLabel("时延状态: 未知")
+        self.latency_indicator_label.setAlignment(Qt.AlignmentFlag.AlignCenter)  # Center text
+        self.latency_indicator_label.setMinimumSize(120, 30)  # Give it a fixed minimum size
+        self.latency_indicator_label.setStyleSheet("""
+            QLabel {
+                background-color: gray;
+                color: white;
+                padding: 5px;
+                border: 2px solid white; /* Add a border */
+                border-radius: 5px;
+                font-weight: bold; /* Make font bold */
+            }
+        """)
+        left_layout.addWidget(self.latency_indicator_label)
 
         self.video_player_container = QWidget()
         self.video_player_container_layout = QVBoxLayout(self.video_player_container)
@@ -773,23 +794,44 @@ class VideoStreamClient(QMainWindow):
         self.ui_timer.timeout.connect(self.update_ui_tick)
         self.ui_timer.start(30)
 
-    def update_ui_tick(self):
-        now_ms = self.master_clock.get_time_ms()
+    def _update_status_display(self):
+        """Updates the network status indicator and charts once per second."""
+        if self.player_status == self.PLAYER_STATE_PLAYING:
+            # Update latency indicator
+            if self.current_latency_ms < 50:
+                self.latency_indicator_label.setStyleSheet(
+                    "background-color: green; color: white; padding: 5px; border-radius: 5px; font-weight: bold;")
+            elif self.current_latency_ms < 150:
+                self.latency_indicator_label.setStyleSheet(
+                    "background-color: yellow; color: black; padding: 5px; border-radius: 5px; font-weight: bold;")
+            else:
+                self.latency_indicator_label.setStyleSheet(
+                    "background-color: red; color: white; padding: 5px; border-radius: 5px; font-weight: bold;")
+            self.latency_indicator_label.setText(f"时延状态: {self.current_latency_ms} ms")
 
-        current_time = time.time()
-        time_diff = current_time - self.monitor.last_reset_time
-        if time_diff > 0:
-            self.current_bitrate_kbps = (self.monitor.total_bytes_received * 8 / 1000) / time_diff
+            # Update charts
+            # Get latest stats from monitor (which resets its counters internally)
+            stats = self.monitor.get_statistics()
+            self.current_bitrate_kbps = stats["bitrate_bps"] / 1000.0  # Convert to kbps
 
-        self.bitrate_chart.update_chart(self.current_bitrate_kbps)
-
-        if self.player_status != self.PLAYER_STATE_PLAYING:
+            # FPS is calculated in update_ui_tick, so just use the stored value
+            self.bitrate_chart.update_chart(self.current_bitrate_kbps)
+            self.fps_chart.update_chart(self.current_fps)
+            self.latency_chart.update_chart(self.current_latency_ms)
+        else:
+            # Player is not playing, reset indicator and clear charts
+            self.latency_indicator_label.setText("时延状态: 未知")
+            self.latency_indicator_label.setStyleSheet(
+                "background-color: gray; color: white; padding: 5px; border-radius: 5px; font-weight: bold;")
             self.bitrate_chart.clear_chart()
             self.fps_chart.clear_chart()
             self.latency_chart.clear_chart()
-            return
 
-        if not self.master_clock.is_paused:
+    def update_ui_tick(self):
+        now_ms = self.master_clock.get_time_ms()
+
+        # Only update video frame and related calculations here
+        if self.player_status == self.PLAYER_STATE_PLAYING and not self.master_clock.is_paused:
             if now_ms != -1:
                 frame_pts, frame_data = self.decoded_frame_buffer.get_frame(now_ms)
                 if frame_data is not None:
@@ -799,19 +841,17 @@ class VideoStreamClient(QMainWindow):
 
                     if frame_pts is not None:
                         self.current_latency_ms = max(0, now_ms - frame_pts)
-
                 else:
                     self.current_latency_ms = 0
             else:
                 self.current_latency_ms = 0
 
+        # FPS calculation (still needs to run frequently to be accurate)
+        current_time = time.time()
         if current_time - self.last_fps_update_time >= 1.0:
             self.current_fps = self.frame_count / (current_time - self.last_fps_update_time)
             self.frame_count = 0
             self.last_fps_update_time = current_time
-
-        self.fps_chart.update_chart(self.current_fps)
-        self.latency_chart.update_chart(self.current_latency_ms)
 
         is_file_stream = self.playback_state['duration_sec'] > 0
         if is_file_stream:
@@ -1033,12 +1073,8 @@ class VideoStreamClient(QMainWindow):
         if self.is_video_fullscreen:
             # Exit fullscreen
             self.showNormal()
-            # Restore to original geometry, and slightly reduce size
-            original_width = self.original_geometry.width()
-            original_height = self.original_geometry.height()
-            reduced_width = max(200, original_width - 50)
-            reduced_height = max(150, original_height - 50)
-            self.setGeometry(self.original_geometry.x(), self.original_geometry.y(), reduced_width, reduced_height)
+            # Restore to original geometry
+            self.setGeometry(self.original_geometry)
 
             # Re-show hidden widgets
             self.left_panel_widget.show()
