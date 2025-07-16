@@ -251,7 +251,9 @@ def stream_from_camera(video_sock, audio_sock, controller, stream_control, clien
             encoder.bit_rate = int(BASE_BITRATE * strategy['multiplier'])
             encoder.framerate = strategy['fps_limit']
             encoder.pix_fmt = 'yuv420p'
-            encoder.options = {'preset': 'ultrafast', 'tune': 'zerolatency'}
+            encoder.options = {'preset': 'ultrafast',
+                               'tune': 'zerolatency',
+                               'bframes': '0'}
             encoder.open(codec);
             last_strategy = strategy
 
@@ -336,13 +338,18 @@ def stream_from_file(video_sock, audio_sock, controller, stream_control, client_
                     encoder.bit_rate = int(BASE_BITRATE * strategy['multiplier'])
                     encoder.framerate = video_stream.average_rate
                     encoder.pix_fmt = 'yuv420p'
-                    encoder.options = {'preset': 'ultrafast', 'tune': 'zerolatency'}
-                    encoder.open(codec);
+                    encoder.options = {'preset': 'ultrafast', 'tune': 'zerolatency',
+                                       'bframes': '0'}
+                    encoder.open(codec)
                     last_strategy = strategy
 
                 if not encoder: continue
-                frame.pts = ts_ms
-                for enc_packet in encoder.encode(frame):
+                ndarray_yuv = frame.to_ndarray(format='yuv420p')
+                clean_frame = av.VideoFrame.from_ndarray(ndarray_yuv, format='yuv420p')
+
+                clean_frame.pts = ts_ms
+
+                for enc_packet in encoder.encode(clean_frame):
                     # [MODIFIED] 使用分包函数发送
                     num_sent = send_packet_fragmented(video_sock, (client_addr[0], VIDEO_PORT), video_seq, ts_ms,
                                                       enc_packet)
