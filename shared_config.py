@@ -10,12 +10,12 @@ AUDIO_PORT = 9997      # 音频数据传输端口
 CONTROL_PORT = 9998    # 控制信令传输端口 (例如: 网络状态反馈)
 
 # --- 视频流参数 ---
-PACKET_SIZE = 1200     # 每个UDP包的数据负载大小 (字节)
+VIDEO_CODEC = 'hevc'   # 视频编码器: hevc (H.265) 或 h264
+# [REMOVED] PACKET_SIZE 不再需要，因为视频编码器会生成大小可变的数据包
 
 # --- 前向纠错 (FEC) 配置 ---
-# 每 FEC_GROUP_SIZE 个数据包，生成一个FEC冗余包。
-# 用于在发生少量丢包时恢复数据。
-FEC_GROUP_SIZE = 10
+# 注意: 在H.265/RTP模型中，FEC实现会更复杂，暂时移除以简化核心逻辑。
+# FEC_GROUP_SIZE = 10
 
 # --- 音频流参数 ---
 # 减小CHUNK大小可以降低捕获延迟，但会增加计算量。

@@ -1,4 +1,4 @@
-# server.py (修复 to_bytes 错误版)
+# server.py (H.265 + RTP over UDP 重构版)
 
 import io
 import cv2
@@ -10,10 +10,8 @@ import os
 import av
 import pyaudio
 import numpy as np
-import struct
 
 from shared_config import *
-
 
 # --- 视频文件扫描 (无变化) ---
 def get_video_files(path="videos"):
@@ -23,14 +21,14 @@ def get_video_files(path="videos"):
     supported_formats = ('.mp4', '.mkv', '.avi', '.mov')
     return [f for f in os.listdir(path) if f.endswith(supported_formats)]
 
-
-# --- 自适应流控器 (无变化) ---
+# --- 自适应流控器 (已更新) ---
 class AdaptiveStreamController:
     def __init__(self):
+        # [MODIFIED] 策略现在控制比特率，而不是JPEG质量
         self.configs = {
-            "good": {"resolution": (640, 480), "jpeg_quality": 85, "fps_limit": 30},
-            "medium": {"resolution": (480, 360), "jpeg_quality": 60, "fps_limit": 20},
-            "poor": {"resolution": (320, 240), "jpeg_quality": 40, "fps_limit": 15}
+            "good": {"resolution": (640, 480), "bitrate": 1000 * 1024, "fps_limit": 30},
+            "medium": {"resolution": (480, 360), "bitrate": 500 * 1024, "fps_limit": 20},
+            "poor": {"resolution": (320, 240), "bitrate": 250 * 1024, "fps_limit": 15}
         }
         self.current_strategy_name = "good"
         self.lock = threading.Lock()
@@ -50,7 +48,6 @@ class AdaptiveStreamController:
             if self.current_strategy_name != new_strategy_name:
                 print(f"[服务端-控制器] 丢包率: {loss_rate:.2%}, 切换策略至: {new_strategy_name.upper()}")
                 self.current_strategy_name = new_strategy_name
-
 
 # --- 推流管理器 (无变化) ---
 class StreamerManager:
@@ -83,7 +80,7 @@ class StreamerManager:
                     print(f"[服务端-管理器] 启动文件点播: {source}")
                     try:
                         with av.open(video_path) as container:
-                            duration_sec = container.duration / av.time_base
+                            duration_sec = container.duration / av.time_base if container.duration else 0
                     except Exception as e:
                         print(f"[服务端-管理器] 错误: 无法读取视频文件信息 {video_path}: {e}")
                         return None
@@ -115,7 +112,6 @@ class StreamerManager:
             if self.stream_control['running']:
                 print(f"[服务端-管理器] 请求跳转到 {target_time_sec:.2f} 秒")
                 self.stream_control['seek_to'] = target_time_sec
-
 
 # --- 控制信道处理 (无变化) ---
 def control_channel_handler(sock, manager):
@@ -155,104 +151,129 @@ def control_channel_handler(sock, manager):
         except Exception as e:
             print(f"[服务端-控制] 错误: {e}")
 
+# --- RTP 简易打包 ---
+def rtp_pack(seq, ts, payload):
+    # 简化的RTP头: 2字节序列号, 4字节时间戳
+    header = seq.to_bytes(2, 'big') + ts.to_bytes(4, 'big', signed=True)
+    return header + payload
 
-# --- 推流实现 (修复 to_bytes) ---
+# --- 推流实现 (H.265重构) ---
 def stream_from_camera(video_sock, audio_sock, controller, stream_control, client_addr):
-    print("[服务端-推流] 摄像头推流激活。")
-    start_time = time.time()
-    p_audio = pyaudio.PyAudio()
+    print("[服务端-推流] 摄像头推流激活 (H.265)。")
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("[服务端-视频] 无法打开摄像头。")
+        return
 
+    start_time = time.time()
+
+    # --- 音频线程 (基本无变化) ---
+    p_audio = pyaudio.PyAudio()
     try:
-        audio_stream = p_audio.open(
-            format=AUDIO_FORMAT,
-            channels=AUDIO_CHANNELS,
-            rate=AUDIO_RATE,
-            input=True,
-            frames_per_buffer=AUDIO_CHUNK
-        )
+        audio_stream = p_audio.open(format=AUDIO_FORMAT, channels=AUDIO_CHANNELS, rate=AUDIO_RATE,
+                                    input=True, frames_per_buffer=AUDIO_CHUNK)
     except Exception as e:
         print(f"[服务端-音频] 致命错误: 无法打开麦克风: {e}")
         p_audio.terminate()
+        cap.release()
         return
 
-    def audio_thread_func(stream_start_time):
-        sequence_number = 0
+    def audio_thread_func():
+        audio_seq = 0
         while stream_control.get('running'):
             try:
-                pts_ms = int((time.time() - stream_start_time) * 1000)
                 audio_data = audio_stream.read(AUDIO_CHUNK, exception_on_overflow=False)
-                # ### 关键修复：增加 signed=True ###
-                header = sequence_number.to_bytes(8, 'big') + pts_ms.to_bytes(8, 'big', signed=True)
+                ts = int((time.time() - start_time) * 1000) # 时间戳 (毫秒)
+                header = audio_seq.to_bytes(4, 'big') + ts.to_bytes(4, 'big')
                 audio_sock.sendto(header + audio_data, (client_addr[0], AUDIO_PORT))
-                sequence_number = (sequence_number + 1) % (2**64)
+                audio_seq = (audio_seq + 1) % (2**32)
             except IOError:
                 break
-
         audio_stream.stop_stream()
         audio_stream.close()
         p_audio.terminate()
         print("[服务端-音频] 音频捕获线程已停止。")
 
-    audio_thread = threading.Thread(target=audio_thread_func, args=(start_time,), daemon=True)
+    audio_thread = threading.Thread(target=audio_thread_func, daemon=True)
     audio_thread.start()
 
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("[服务端-视频] 无法打开摄像头。")
-        stream_control['running'] = False
-        return
+    # --- H.265 编码器设置 ---
+    codec = av.codec.Codec(VIDEO_CODEC, 'w')
+    encoder = av.codec.context.CodecContext.create(VIDEO_CODEC, 'w')
+    video_seq = 0
+    last_strategy = {}
 
-    frame_id = 0
-    while stream_control.get('running') and cap.isOpened():
+    while stream_control.get('running'):
         ret, frame = cap.read()
-        if not ret:
-            break
+        if not ret: break
 
-        pts_ms = int((time.time() - start_time) * 1000)
         strategy = controller.get_current_strategy()
+
+        # 当策略变化时，重新配置编码器
+        if strategy != last_strategy:
+            print(f"[服务端-编码器] 应用新策略: {strategy}")
+            encoder = av.codec.context.CodecContext.create(VIDEO_CODEC, 'w')
+            encoder.width = strategy['resolution'][0]
+            encoder.height = strategy['resolution'][1]
+            encoder.bit_rate = strategy['bitrate']
+            encoder.framerate = strategy['fps_limit']
+            encoder.pix_fmt = 'yuv420p' # H.265常用格式
+            encoder.open(codec)
+            last_strategy = strategy
+
+        # 帧处理
         frame = cv2.resize(frame, strategy["resolution"])
-        _, encoded_frame = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), strategy["jpeg_quality"]])
-        frame_data = encoded_frame.tobytes()
-        total_packets = (len(frame_data) + PACKET_SIZE - 1) // PACKET_SIZE
+        av_frame = av.VideoFrame.from_ndarray(frame, format='bgr24')
+        av_frame.pts = int((time.time() - start_time) * 1000) # 使用毫秒级时间戳
 
-        for i in range(total_packets):
-            chunk = frame_data[i * PACKET_SIZE:(i + 1) * PACKET_SIZE]
-            # ### 关键修复：增加 signed=True ###
-            header = frame_id.to_bytes(4, 'big') + pts_ms.to_bytes(8, 'big', signed=True) + \
-                     i.to_bytes(2, 'big') + total_packets.to_bytes(2, 'big')
-            video_sock.sendto(header + chunk, (client_addr[0], VIDEO_PORT))
+        # 编码并发送
+        try:
+            for packet in encoder.encode(av_frame):
+                # 简化的RTP打包
+                rtp_packet = rtp_pack(video_seq, av_frame.pts, packet)
+                video_sock.sendto(rtp_packet, (client_addr[0], VIDEO_PORT))
+                video_seq = (video_seq + 1) % (2**16)
+        except Exception as e:
+            print(f"[服务端-编码器] 编码错误: {e}")
 
-        frame_id = (frame_id + 1) % (2 ** 32 - 1)
         time.sleep(1 / strategy["fps_limit"])
 
-    if cap.isOpened():
-        cap.release()
+    cap.release()
     print("[服务端-推流] 摄像头推流结束。")
 
 
 def stream_from_file(video_sock, audio_sock, controller, stream_control, client_addr, video_path):
+    print(f"[服务端-推流] 文件推流激活 (H.265转码): {video_path}")
     try:
         container = av.open(video_path)
     except Exception as e:
         print(f"错误: 无法打开视频文件 {video_path} - {e}")
         return
 
+    # --- H.265 编码器设置 ---
+    codec = av.codec.Codec(VIDEO_CODEC, 'w')
+    encoder = None # 在循环中根据策略动态创建
+    last_strategy = {}
+
     video_stream = next((s for s in container.streams if s.type == 'video'), None)
     audio_stream = next((s for s in container.streams if s.type == 'audio'), None)
 
     if not video_stream:
-        print(f"错误: {video_path} 中没有视频流。")
+        print("文件中无视频流")
         container.close()
         return
 
-    print(f"[服务端-推流] 开始推流文件: {video_path}")
     start_time = time.time()
-    frame_id, audio_sequence_number = 0, 0
+    video_seq, audio_seq = 0, 0
+
+    # 音频重采样器
     resampler = av.audio.resampler.AudioResampler(format='s16', layout='mono', rate=AUDIO_RATE) if audio_stream else None
     audio_buffer = b''
-    chunk_byte_size = AUDIO_CHUNK * 2 * AUDIO_CHANNELS
+    chunk_byte_size = AUDIO_CHUNK * 2 * AUDIO_CHANNELS # 16-bit = 2 bytes
 
+    # 主循环
     while stream_control.get('running'):
+        # 跳转逻辑
         if stream_control['seek_to'] >= 0:
             target_sec = stream_control['seek_to']
             stream_control['seek_to'] = -1.0
@@ -264,57 +285,65 @@ def stream_from_file(video_sock, audio_sock, controller, stream_control, client_
             except Exception as e:
                 print(f"[服务端-推流] 跳转失败: {e}")
 
+        # 解码源文件包
         try:
             packet = next(container.demux(video_stream, audio_stream))
         except StopIteration:
             print("[服务端-推流] 文件播放结束。")
             break
 
-        if packet.dts is None:
-            continue
+        if packet.dts is None: continue
 
         current_pts_sec = float(packet.pts * packet.time_base)
         elapsed_time = time.time() - start_time
 
+        # 同步播放时间
         if current_pts_sec > elapsed_time:
             time.sleep(max(0, current_pts_sec - elapsed_time))
 
-        pts_ms = int(current_pts_sec * 1000)
+        ts_ms = int(current_pts_sec * 1000)
 
         for frame in packet.decode():
-            if not stream_control.get('running'):
-                break
+            if not stream_control.get('running'): break
 
-            if packet.stream.type == 'video':
-                img = frame.to_image()
+            # --- 视频处理 ---
+            if isinstance(frame, av.VideoFrame):
                 strategy = controller.get_current_strategy()
-                img = img.resize(strategy["resolution"])
-                buffer = io.BytesIO()
-                img.save(buffer, format="JPEG", quality=strategy["jpeg_quality"])
-                frame_data = buffer.getvalue()
-                total_packets = (len(frame_data) + PACKET_SIZE - 1) // PACKET_SIZE
 
-                for i in range(total_packets):
-                    chunk = frame_data[i * PACKET_SIZE:(i + 1) * PACKET_SIZE]
-                    # ### 关键修复：增加 signed=True ###
-                    header = frame_id.to_bytes(4, 'big') + pts_ms.to_bytes(8, 'big', signed=True) + \
-                             i.to_bytes(2, 'big') + total_packets.to_bytes(2, 'big')
-                    video_sock.sendto(header + chunk, (client_addr[0], VIDEO_PORT))
+                # 动态调整编码器
+                if strategy != last_strategy:
+                    print(f"[服务端-编码器] 应用新策略: {strategy}")
+                    encoder = av.codec.context.CodecContext.create(VIDEO_CODEC, 'w')
+                    encoder.width = strategy['resolution'][0]
+                    encoder.height = strategy['resolution'][1]
+                    encoder.bit_rate = strategy['bitrate']
+                    encoder.framerate = video_stream.average_rate
+                    encoder.pix_fmt = 'yuv420p'
+                    encoder.open(codec)
+                    last_strategy = strategy
 
-                frame_id = (frame_id + 1) % (2 ** 32 - 1)
+                if not encoder: continue
 
-            elif packet.stream.type == 'audio' and resampler:
-                resampled_frames = resampler.resample(frame)
-                for resampled_frame in resampled_frames:
+                # 改变分辨率并送入编码器
+                resized_frame = frame.reformat(width=strategy['resolution'][0], height=strategy['resolution'][1], format='yuv420p')
+                resized_frame.pts = ts_ms # 必须设置PTS
+
+                for enc_packet in encoder.encode(resized_frame):
+                    rtp_packet = rtp_pack(video_seq, ts_ms, enc_packet)
+                    video_sock.sendto(rtp_packet, (client_addr[0], VIDEO_PORT))
+                    video_seq = (video_seq + 1) % (2**16)
+
+            # --- 音频处理 ---
+            elif isinstance(frame, av.AudioFrame) and resampler:
+                for resampled_frame in resampler.resample(frame):
                     audio_buffer += resampled_frame.to_ndarray().tobytes()
 
-                    while len(audio_buffer) >= chunk_byte_size:
-                        audio_chunk_to_send = audio_buffer[:chunk_byte_size]
-                        audio_buffer = audio_buffer[chunk_byte_size:]
-                        # ### 关键修复：增加 signed=True ###
-                        header = audio_sequence_number.to_bytes(8, 'big') + pts_ms.to_bytes(8, 'big', signed=True)
-                        audio_sock.sendto(header + audio_chunk_to_send, (client_addr[0], AUDIO_PORT))
-                        audio_sequence_number = (audio_sequence_number + 1) % (2**64)
+                while len(audio_buffer) >= chunk_byte_size:
+                    chunk = audio_buffer[:chunk_byte_size]
+                    audio_buffer = audio_buffer[chunk_byte_size:]
+                    header = audio_seq.to_bytes(4, 'big') + ts_ms.to_bytes(4, 'big', signed=True)
+                    audio_sock.sendto(header + chunk, (client_addr[0], AUDIO_PORT))
+                    audio_seq = (audio_seq + 1) % (2**32)
 
     container.close()
     print(f"[服务端-推流] 文件 {video_path} 推流结束。")
@@ -332,14 +361,10 @@ def main():
     controller = AdaptiveStreamController()
     manager = StreamerManager(sockets['video'], sockets['audio'], controller)
 
-    control_thread = threading.Thread(
-        target=control_channel_handler,
-        args=(sockets['control'], manager),
-        daemon=True
-    )
+    control_thread = threading.Thread(target=control_channel_handler, args=(sockets['control'], manager), daemon=True)
     control_thread.start()
 
-    print(f"[服务端] 服务器已启动于 {SERVER_HOST}:{CONTROL_PORT}。按 Ctrl+C 关闭。")
+    print(f"[服务端] 服务器已启动于 {SERVER_HOST}:{CONTROL_PORT} (H.265/RTP模式)。按 Ctrl+C 关闭。")
 
     try:
         control_thread.join()
@@ -349,7 +374,6 @@ def main():
         manager.stop_stream()
         [sock.close() for sock in sockets.values()]
         print("[服务端] 服务器已关闭。")
-
 
 if __name__ == "__main__":
     main()
