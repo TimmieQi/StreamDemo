@@ -11,15 +11,10 @@ CONTROL_PORT = 9998    # 控制信令传输端口 (例如: 网络状态反馈)
 
 # --- 视频流参数 ---
 VIDEO_CODEC = 'hevc'   # 视频编码器: hevc (H.265) 或 h264
-# [REMOVED] PACKET_SIZE 不再需要，因为视频编码器会生成大小可变的数据包
-
-# --- 前向纠错 (FEC) 配置 ---
-# 注意: 在H.265/RTP模型中，FEC实现会更复杂，暂时移除以简化核心逻辑。
-# FEC_GROUP_SIZE = 10
 
 # --- 音频流参数 ---
 # 减小CHUNK大小可以降低捕获延迟，但会增加计算量。
-# 比如512 / 16000Hz = 32ms 的捕获延迟。
+# 比如256 / 16000Hz = 16ms 的捕获延迟。
 AUDIO_CHUNK = 256      # 每次读取的音频数据大小 (样本数)
 AUDIO_FORMAT = 8        # paInt16, 16位音频
 AUDIO_CHANNELS = 1      # 单声道
