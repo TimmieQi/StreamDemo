@@ -184,7 +184,7 @@ def stream_from_camera(video_sock, audio_sock, controller, stream_control, clien
             try:
                 audio_data = audio_stream.read(AUDIO_CHUNK, exception_on_overflow=False)
                 ts = int((time.time() - start_time) * 1000) # 时间戳 (毫秒)
-                header = audio_seq.to_bytes(4, 'big') + ts.to_bytes(4, 'big')
+                header = audio_seq.to_bytes(4, 'big') + ts.to_bytes(4, 'big', signed=True)
                 audio_sock.sendto(header + audio_data, (client_addr[0], AUDIO_PORT))
                 audio_seq = (audio_seq + 1) % (2**32)
             except IOError:
@@ -218,6 +218,8 @@ def stream_from_camera(video_sock, audio_sock, controller, stream_control, clien
             encoder.bit_rate = strategy['bitrate']
             encoder.framerate = strategy['fps_limit']
             encoder.pix_fmt = 'yuv420p' # H.265常用格式
+            # 设置一些H.265编码选项以优化实时流
+            encoder.options = {'preset': 'ultrafast', 'tune': 'zerolatency'}
             encoder.open(codec)
             last_strategy = strategy
 
@@ -278,10 +280,17 @@ def stream_from_file(video_sock, audio_sock, controller, stream_control, client_
             target_sec = stream_control['seek_to']
             stream_control['seek_to'] = -1.0
             try:
-                container.seek(int(target_sec * av.time_base))
+                # av.time_base is 1/1,000,000, so we seek in microseconds
+                container.seek(int(target_sec * 1000000), backward=True, any_frame=False)
                 print(f"[服务端-推流] 跳转成功到 {target_sec:.2f}s")
                 start_time = time.time() - target_sec
                 audio_buffer = b''
+
+                # [修正] 关键修复：在跳转后，通过清空last_strategy来强制重新创建编码器。
+                # 这可以清除编码器内部可能存在的旧状态，避免跳转后产生错误的PTS。
+                last_strategy = {}
+                encoder = None
+
             except Exception as e:
                 print(f"[服务端-推流] 跳转失败: {e}")
 
@@ -319,6 +328,7 @@ def stream_from_file(video_sock, audio_sock, controller, stream_control, client_
                     encoder.bit_rate = strategy['bitrate']
                     encoder.framerate = video_stream.average_rate
                     encoder.pix_fmt = 'yuv420p'
+                    encoder.options = {'preset': 'ultrafast', 'tune': 'zerolatency'}
                     encoder.open(codec)
                     last_strategy = strategy
 
@@ -341,6 +351,8 @@ def stream_from_file(video_sock, audio_sock, controller, stream_control, client_
                 while len(audio_buffer) >= chunk_byte_size:
                     chunk = audio_buffer[:chunk_byte_size]
                     audio_buffer = audio_buffer[chunk_byte_size:]
+                    # 使用与视频帧相同的PTS计算方法，确保同步
+                    audio_ts_ms = int((start_time + (time.time() - start_time)) * 1000)
                     header = audio_seq.to_bytes(4, 'big') + ts_ms.to_bytes(4, 'big', signed=True)
                     audio_sock.sendto(header + chunk, (client_addr[0], AUDIO_PORT))
                     audio_seq = (audio_seq + 1) % (2**32)

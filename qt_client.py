@@ -21,43 +21,58 @@ from PySide6.QtCore import Qt, QTimer, Signal, QObject
 
 from shared_config import *
 
-# --- 信号与时钟 (无变化) ---
+# --- 信号 (无变化) ---
 class WorkerSignals(QObject):
     play_info_received = Signal(dict)
     play_failed = Signal(str)
 
+# --- [已重构] 主时钟 ---
+# 这是一个由音频播放驱动的状态报告时钟，不再基于系统时间自由运行
 class MasterClock:
-    # ... (代码与原版相同，此处省略以节省篇幅) ...
-    def __init__(self): self.reset()
+    def __init__(self):
+        self.reset()
+
     def reset(self):
-        self._lock = threading.RLock(); self._start_pts_ms = -1; self._start_time = -1
-        self._paused_at_time = -1; self._rate = 1.0
-    @property
-    def is_paused(self): return self._paused_at_time != -1
-    def start(self, pts_ms, audio_latency_sec=0.0):
+        self._lock = threading.RLock()
+        self._current_pts_ms = -1
+        self._paused = False
+
+    def start(self, pts_ms):
+        """仅在第一次接收到音频时调用，以设置初始时间"""
         with self._lock:
-            if self._start_time == -1 and pts_ms is not None:
-                self._start_pts_ms = pts_ms; self._start_time = time.time() - audio_latency_sec
-                print(f"[时钟] 主时钟启动。初始PTS: {pts_ms}ms, 音频延迟补偿: {audio_latency_sec*1000:.2f}ms")
+            if self._current_pts_ms == -1 and pts_ms is not None:
+                self._current_pts_ms = pts_ms
+                print(f"[时钟] 主时钟启动。初始PTS: {pts_ms}ms")
+
+    def update_time(self, pts_ms):
+        """由音频播放线程调用，用实际播放的PTS来驱动时钟前进"""
+        with self._lock:
+            if not self._paused and pts_ms is not None:
+                self._current_pts_ms = pts_ms
+
     def get_time_ms(self):
+        """获取由音频驱动的当前播放时间"""
         with self._lock:
-            if self._start_time == -1: return -1
-            if self.is_paused:
-                elapsed_before_pause = self._paused_at_time - self._start_time
-                return self._start_pts_ms + int(elapsed_before_pause * 1000 * self._rate)
-            elapsed = time.time() - self._start_time
-            return self._start_pts_ms + int(elapsed * 1000 * self._rate)
+            return self._current_pts_ms
+
+    @property
+    def is_paused(self):
+        return self._paused
+
     def pause(self):
         with self._lock:
-            if not self.is_paused and self._start_time != -1: self._paused_at_time = time.time()
+            self._paused = True
+
     def resume(self):
         with self._lock:
-            if self.is_paused:
-                paused_duration = time.time() - self._paused_at_time
-                self._start_time += paused_duration; self._paused_at_time = -1
-    def set_rate(self, rate): self._rate = 1.0
+            self._paused = False
 
-# --- 网络监控 (基本无变化) ---
+    # set_rate 在这个模型中不再有意义，因为时钟由数据驱动，而不是时间流逝驱动
+    def set_rate(self, rate):
+        pass
+
+
+# --- 网络监控 (无变化) ---
 class NetworkMonitor:
     def __init__(self): self.reset()
     def reset(self):
@@ -76,7 +91,7 @@ class NetworkMonitor:
             self.received_packets = 0; self.lost_packets = 0
             return {"loss_rate": loss_rate}
 
-# --- 视频Jitter Buffer (已更新为RTP包) ---
+# --- 视频Jitter Buffer (无变化) ---
 class VideoPacketJitterBuffer:
     def __init__(self, max_size=200):
         self.max_size = max_size
@@ -108,10 +123,11 @@ class VideoPacketJitterBuffer:
                 heapq.heappop(self.buffer)
                 return self.get_packet() # 递归获取下一个
             else: # 丢包发生
-                self.expected_seq = (self.expected_seq + 1) % (2**16)
-                return None # 返回None表示需要解码器插入一个空包
+                seq, packet = heapq.heappop(self.buffer)
+                self.expected_seq = (seq + 1) % (2**16)
+                return packet
 
-# --- [新增] 解码后帧的缓冲 ---
+# --- 解码后帧的缓冲 (无变化) ---
 class DecodedFrameBuffer:
     def __init__(self, buffer_size_ms=500):
         self.buffer_size_ms = buffer_size_ms
@@ -125,32 +141,26 @@ class DecodedFrameBuffer:
     def add_frame(self, frame): # frame是(pts, image_data)
         with self.lock:
             self.queue.append(frame)
-            # 保持队列有序 (通常解码器输出就是有序的)
             self.queue = deque(sorted(self.queue, key=lambda x: x[0]))
 
     def get_frame(self, target_pts_ms):
         with self.lock:
             if not self.queue or target_pts_ms == -1: return None
-
             best_frame = None
-            # 找到最接近且不晚于当前时钟的帧
             for pts, img_data in self.queue:
                 if pts <= target_pts_ms:
                     best_frame = (pts, img_data)
                 else:
                     break
-
             if best_frame:
                 self.last_played_pts = best_frame[0]
-                # 丢弃所有比已播放帧更早的帧
                 while self.queue and self.queue[0][0] <= self.last_played_pts:
                     self.queue.popleft()
                 return best_frame[1]
             return None
 
-# --- 音频Jitter Buffer (已更新) ---
+# --- 音频Jitter Buffer (无变化) ---
 class AudioJitterBuffer:
-    # ... (代码与原版类似，但解析的是4字节seq + 4字节ts，此处省略) ...
     def __init__(self, max_size=200):
         self.max_size = max_size; self.silence = b'\x00' * (AUDIO_CHUNK * 2 * AUDIO_CHANNELS); self.reset()
     def reset(self): self.lock = threading.Lock(); self.buffer = []; self.expected_seq = -1
@@ -176,7 +186,7 @@ class AudioJitterBuffer:
                 self.expected_seq += 1; return None, self.silence
     def clear(self): self.reset()
 
-# --- 线程函数 (已重构) ---
+# --- 线程函数 ---
 def video_receiver_thread(sock, packet_buffer, monitor, running_flag):
     while running_flag.get('running'):
         try:
@@ -186,7 +196,6 @@ def video_receiver_thread(sock, packet_buffer, monitor, running_flag):
             continue
 
 def audio_receiver_thread(sock, audio_buffer, running_flag):
-    # ... (代码与原版类似，但接收的包格式变了，此处省略) ...
     while running_flag.get('running'):
         try:
             audio_buffer.add_chunk(sock.recvfrom(8 + AUDIO_CHUNK * 2)[0])
@@ -194,7 +203,6 @@ def audio_receiver_thread(sock, audio_buffer, running_flag):
             if not running_flag.get('running'): break
             continue
 
-# --- 视频解码线程 ---
 def video_decoder_thread(packet_buffer, frame_buffer, clock, running_flag):
     print("[客户端-解码] 视频解码线程启动。")
     try:
@@ -210,33 +218,22 @@ def video_decoder_thread(packet_buffer, frame_buffer, clock, running_flag):
             time.sleep(0.005) # Jitter buffer在等待包
             continue
 
-        # 解析简化的RTP头
         ts = int.from_bytes(packet_data[2:6], 'big', signed=True)
         payload = packet_data[6:]
 
         try:
-            # pyav需要AVPacket对象
             av_packet = av.Packet(payload)
             av_packet.pts = ts
-
             for frame in decoder.decode(av_packet):
-                # [修正] 关键修复：移除视频解码线程启动时钟的逻辑。
-                # 视频流永远是“跟随者”，主时钟必须由音频流（“主导者”）启动。
-                # if clock.get_time_ms() == -1:
-                #     clock.start(frame.pts) # <- 这行代码是导致问题的根源，必须删除
-
                 img = frame.to_ndarray(format='rgb24')
                 frame_buffer.add_frame((frame.pts, img))
-
-        except Exception as e:
-            # 解码可能会因丢包而出错，可忽略
-            # print(f"解码错误: {e}") # 调试时可以打开
+        except Exception:
             pass
     print("[客户端-解码] 视频解码线程已停止。")
 
 
+# --- [已修改] 音频播放线程 ---
 def audio_player_thread(audio_buffer, clock, state_vars, running_flag):
-    # ... (代码与原版几乎相同，此处省略) ...
     p = pyaudio.PyAudio(); stream = None
     try:
         stream = p.open(format=pyaudio.paInt16, channels=AUDIO_CHANNELS, rate=AUDIO_RATE, output=True)
@@ -245,22 +242,44 @@ def audio_player_thread(audio_buffer, clock, state_vars, running_flag):
             if is_file_stream and clock.is_paused:
                 if stream.is_active(): stream.stop_stream()
                 time.sleep(0.01); continue
-            if not stream.is_active(): stream.start_stream()
+
+            if not stream.is_active() and not clock.is_paused: stream.start_stream()
+
             pts_ms, chunk = audio_buffer.get_chunk()
-            if not chunk: time.sleep(0.005); continue
-            if clock.get_time_ms() == -1: clock.start(pts_ms, stream.get_output_latency())
+
+            # 如果缓冲区为空，等待一下，避免CPU空转
+            # 这也是处理网络卡顿和播放结束的关键
+            if not chunk:
+                time.sleep(0.01)
+                continue
+
+            # 只有音频线程可以启动和更新时钟
+            if clock.get_time_ms() == -1 and pts_ms is not None:
+                clock.start(pts_ms)
+
+            # [关键修改] 用实际播放的音频块PTS来更新主时钟
+            if pts_ms is not None:
+                clock.update_time(pts_ms)
+
+            # 播放音频
             if state_vars['volume'] < 1.0:
-                samples = np.frombuffer(chunk, dtype=np.int16); samples = (samples * state_vars['volume']).astype(np.int16)
+                samples = np.frombuffer(chunk, dtype=np.int16)
+                samples = (samples * state_vars['volume']).astype(np.int16)
                 stream.write(samples.tobytes())
-            else: stream.write(chunk)
-    except Exception as e: import traceback; print(f"[客户端-播放] [致命错误] 音频播放时发生异常: {e}"); traceback.print_exc()
+            else:
+                stream.write(chunk)
+
+    except Exception as e:
+        import traceback
+        print(f"[客户端-播放] [致命错误] 音频播放时发生异常: {e}")
+        traceback.print_exc()
     finally:
         if stream: stream.close()
-        p.terminate(); print("[客户端-播放] 音频播放线程已停止。")
+        p.terminate()
+        print("[客户端-播放] 音频播放线程已停止。")
 
 
 def feedback_sender_thread(sock, server_addr, monitor, running_flag):
-    # ... (代码与原版相同，此处省略) ...
     while running_flag.get('running'):
         time.sleep(1)
         if not running_flag.get('running'): break
@@ -270,20 +289,19 @@ def feedback_sender_thread(sock, server_addr, monitor, running_flag):
         except socket.error: break
 
 
-# --- QT6主窗口类 (UI更新逻辑已修改) ---
+# --- QT6主窗口类 ---
 class VideoStreamClient(QMainWindow):
     def __init__(self):
         super().__init__()
-        # ... (初始化变量与原版类似, 但增加了frame_buffer) ...
         self.is_connected = False; self.running_flag = {'running': False}; self.sockets = {}; self.threads = {}
         self.server_address = None; self.current_source = "无"; self.scale_mode = "fit"; self.last_frame = None
         self.PLAYER_STATE_STOPPED, self.PLAYER_STATE_LOADING, self.PLAYER_STATE_PLAYING = 0, 1, 2
         self.player_status = self.PLAYER_STATE_STOPPED
-        self.playback_state = {'duration_sec': 0, 'volume': 1.0, 'rate': 1.0}
+        self.playback_state = {'duration_sec': 0, 'volume': 1.0, 'rate': 1.0, 'playback_finished': False}
 
         self.monitor = NetworkMonitor()
-        self.video_packet_jitter_buffer = VideoPacketJitterBuffer() # [MODIFIED]
-        self.decoded_frame_buffer = DecodedFrameBuffer()           # [NEW]
+        self.video_packet_jitter_buffer = VideoPacketJitterBuffer()
+        self.decoded_frame_buffer = DecodedFrameBuffer()
         self.audio_jitter_buffer = AudioJitterBuffer()
         self.master_clock = MasterClock()
 
@@ -294,7 +312,6 @@ class VideoStreamClient(QMainWindow):
         self.init_ui()
         self.start_ui_updater()
 
-    # ... (init_ui, format_time, toggle_connection, connect, disconnect 等UI设置函数与原版相同, 此处省略) ...
     def init_ui(self):
         self.setWindowTitle("高级视频流客户端 (H.265版)")
         self.setGeometry(100, 100, 1000, 800)
@@ -322,9 +339,7 @@ class VideoStreamClient(QMainWindow):
         self.status_bar=QStatusBar(); self.status_bar.showMessage("状态: 未连接"); self.setStatusBar(self.status_bar)
         self.video_label.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu); self.video_label.customContextMenuRequested.connect(self.show_context_menu)
     def format_time(self, seconds): s=int(seconds); return f"{s // 60:02d}:{s % 60:02d}"
-    def toggle_connection(self):
-        if self.is_connected: self.disconnect()
-        else: self.connect()
+
     def connect(self):
         server_ip = self.ip_entry.text()
         if not server_ip: self.status_bar.showMessage("错误: 请输入服务器IP地址"); return
@@ -339,6 +354,11 @@ class VideoStreamClient(QMainWindow):
             self.start_threads(); self.is_connected = True; self.connect_btn.setText("断开"); self.play_btn.setEnabled(True)
             self.status_bar.showMessage("状态: 连接成功，请选择播放项")
         except Exception as e: self.status_bar.showMessage(f"连接失败: {str(e)}"); self.cleanup()
+
+    def toggle_connection(self):
+        if self.is_connected: self.disconnect()
+        else: self.connect()
+
     def disconnect(self):
         if self.sockets.get('control') and self.server_address:
             try: self.sockets['control'].sendto(json.dumps({"command": "stop"}).encode(), self.server_address)
@@ -348,26 +368,44 @@ class VideoStreamClient(QMainWindow):
     def start_ui_updater(self):
         self.ui_timer = QTimer(self)
         self.ui_timer.timeout.connect(self.update_ui_tick)
-        self.ui_timer.start(20) # 50 FPS UI updates
+        self.ui_timer.start(30) # UI更新频率无需太高
 
+    # --- [已修改] UI更新逻辑 ---
     def update_ui_tick(self):
-        # [MODIFIED] UI更新逻辑现在从解码后的帧缓冲中获取数据
         now_ms = self.master_clock.get_time_ms()
-        if self.player_status == self.PLAYER_STATE_PLAYING:
-            is_file_stream = self.playback_state['duration_sec'] > 0
-            if not (is_file_stream and self.master_clock.is_paused):
-                if now_ms != -1:
-                    # 从解码帧缓冲获取与当前时间匹配的帧
-                    frame_data = self.decoded_frame_buffer.get_frame(now_ms)
-                    if frame_data is not None:
-                        self.last_frame = frame_data
-                        self.display_frame()
+        if self.player_status != self.PLAYER_STATE_PLAYING:
+            return
 
-            # 更新进度条和时间
-            if is_file_stream and now_ms != -1:
-                current_sec = now_ms / 1000.0; total_sec = self.playback_state['duration_sec']
+        # 视频帧渲染
+        if not self.master_clock.is_paused:
+            if now_ms != -1:
+                frame_data = self.decoded_frame_buffer.get_frame(now_ms)
+                if frame_data is not None:
+                    self.last_frame = frame_data
+                    self.display_frame()
+
+        # 进度条和时间标签更新
+        is_file_stream = self.playback_state['duration_sec'] > 0
+        if is_file_stream:
+            # 如果已标记为播放结束，则不再更新
+            if self.playback_state.get('playback_finished', False):
+                return
+
+            total_sec = self.playback_state['duration_sec']
+            if now_ms != -1:
+                current_sec = now_ms / 1000.0
+
+                # [关键修改] 处理播放结束的情况
+                if current_sec >= total_sec:
+                    current_sec = total_sec
+                    self.playback_state['playback_finished'] = True
+                    self.play_pause_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
+                    print("[客户端] 视频播放结束。")
+
                 if not self.progress_slider.isSliderDown():
-                    self.progress_slider.setValue(int(current_sec / total_sec * 1000))
+                    if total_sec > 0:
+                        self.progress_slider.setValue(int(current_sec / total_sec * 1000))
+
                 self.time_label.setText(f"{self.format_time(current_sec)} / {self.format_time(total_sec)}")
 
     def display_frame(self):
@@ -404,16 +442,15 @@ class VideoStreamClient(QMainWindow):
             self.threads[name].start()
 
     def reset_playback_state(self):
-        # [MODIFIED] 重置所有缓冲区
+        print("[客户端] 重置所有播放状态和缓冲区...")
         self.video_packet_jitter_buffer.reset()
         self.decoded_frame_buffer.reset()
-        self.audio_jitter_buffer.reset()
+        self.audio_jitter_buffer.clear() # audio buffer有自己的clear方法
         self.master_clock.reset()
         self.monitor.reset()
+        self.last_frame = None
+        self.playback_state['playback_finished'] = False # 重置播放结束标记
 
-    # ... (play_selected, request_play_worker, on_play_info_received, on_play_failed, toggle_pause,
-    #      seek_slider_moved, seek_slider_released, change_volume, change_speed, reset_playback_ui,
-    #      setup_ui_for_playback, show_context_menu, set_scale_mode, closeEvent 等函数与原版相同, 此处省略) ...
     def play_selected(self):
         selected_items=self.video_list.selectedItems();
         if not selected_items: self.status_bar.showMessage("提示: 请先选择一个视频"); return
@@ -421,6 +458,7 @@ class VideoStreamClient(QMainWindow):
         self.reset_playback_state(); self.player_status=self.PLAYER_STATE_LOADING
         self.video_label.setText("加载中..."); self.status_bar.showMessage(f"状态: 正在请求播放 {self.current_source}...")
         threading.Thread(target=self.request_play_worker, daemon=True).start()
+
     def request_play_worker(self):
         try:
             self.sockets['control'].sendto(json.dumps({"command": "play", "source": self.current_source}).encode(), self.server_address)
@@ -429,30 +467,48 @@ class VideoStreamClient(QMainWindow):
             if response.get("command") == "play_info": self.worker_signals.play_info_received.emit(response)
             else: self.worker_signals.play_failed.emit("错误: 服务器响应无效")
         except Exception as e: self.worker_signals.play_failed.emit(f"播放失败: {str(e)}")
+
     def on_play_info_received(self, response):
-        self.player_status = self.PLAYER_STATE_PLAYING; self.playback_state['duration_sec'] = response.get("duration", 0)
+        self.player_status = self.PLAYER_STATE_PLAYING
+        self.playback_state['duration_sec'] = response.get("duration", 0)
+        self.playback_state['playback_finished'] = False # 确保新播放开始时标记为未结束
         self.setup_ui_for_playback(is_file_stream=(self.playback_state['duration_sec'] > 0))
         self.status_bar.showMessage(f"状态: 正在播放 {self.current_source}")
+
     def on_play_failed(self, error_message): self.player_status=self.PLAYER_STATE_STOPPED; self.status_bar.showMessage(error_message); self.reset_playback_ui()
+
     def toggle_pause(self):
-        if self.master_clock.is_paused: self.master_clock.resume(); self.play_pause_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
-        else: self.master_clock.pause(); self.play_pause_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
+        if self.playback_state.get('playback_finished', False): return # 播放结束后，暂停/播放按钮无效
+        if self.master_clock.is_paused:
+            self.master_clock.resume()
+            self.play_pause_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
+        else:
+            self.master_clock.pause()
+            self.play_pause_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
+
     def seek_slider_moved(self, value):
-        if self.playback_state['duration_sec'] > 0: target_sec=self.playback_state['duration_sec']*(value/1000.0); self.time_label.setText(f"{self.format_time(target_sec)} / {self.format_time(self.playback_state['duration_sec'])}")
+        if self.playback_state['duration_sec'] > 0:
+            target_sec=self.playback_state['duration_sec']*(value/1000.0)
+            self.time_label.setText(f"{self.format_time(target_sec)} / {self.format_time(self.playback_state['duration_sec'])}")
+
     def seek_slider_released(self):
         if self.playback_state['duration_sec'] == 0: return
-        target_sec=self.playback_state['duration_sec']*(self.progress_slider.value()/1000.0); print(f"[客户端] 请求跳转到 {target_sec:.2f}s")
+        target_sec=self.playback_state['duration_sec']*(self.progress_slider.value()/1000.0)
+        print(f"[客户端] 请求跳转到 {target_sec:.2f}s")
+        self.reset_playback_state()
         try:
             self.sockets['control'].sendto(json.dumps({"command": "seek", "time": target_sec}).encode(), self.server_address)
-            self.reset_playback_state()
             if self.master_clock.is_paused: self.toggle_pause()
         except Exception as e: self.status_bar.showMessage(f"跳转失败: {e}")
+
     def change_volume(self, value): self.playback_state['volume'] = value/100.0
-    def change_speed(self, index): self.playback_state['rate']=1.0; self.master_clock.set_rate(1.0)
+    def change_speed(self, index): pass # set_rate in the new clock model is a no-op
+
     def reset_playback_ui(self):
         self.video_label.clear(); self.video_label.setText("请连接服务器并选择一个视频源"); self.time_label.setText("00:00 / 00:00")
         self.progress_slider.setValue(0); self.progress_slider.setEnabled(False); self.play_pause_btn.setEnabled(False)
         self.play_pause_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay)); self.speed_combo.setEnabled(False)
+
     def setup_ui_for_playback(self, is_file_stream):
         self.progress_slider.setEnabled(is_file_stream); self.play_pause_btn.setEnabled(is_file_stream); self.speed_combo.setEnabled(False)
         if is_file_stream:
@@ -460,6 +516,7 @@ class VideoStreamClient(QMainWindow):
         else:
             self.time_label.setText("直播"); self.progress_slider.setValue(0)
             self.play_pause_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaStop)); self.play_pause_btn.setEnabled(False)
+
     def show_context_menu(self, pos):
         menu=QMenu(self); actions={"自适应缩放 (Adapt)": "adapt", "按比例缩放 (Fit)": "fit", "原始大小 (Original)": "original"}
         for text, mode in actions.items():
