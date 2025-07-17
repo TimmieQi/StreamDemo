@@ -281,7 +281,6 @@ def stream_from_camera(video_sock, audio_sock, controller, stream_control, clien
 def stream_from_file(video_sock, audio_sock, controller, stream_control, client_addr, video_path):
     print(f"[服务端-推流] 文件推流激活 (H.265转码, 动态码率): {video_path}")
     try:
-        # 明确以只读模式'r'打开容器
         container = av.open(video_path, 'r')
     except Exception as e:
         print(f"错误: 无法打开视频文件 {video_path} - {e}"); return
@@ -291,8 +290,12 @@ def stream_from_file(video_sock, audio_sock, controller, stream_control, client_
     if not video_stream:
         print("文件中无视频流"); container.close(); return
 
+    # [NEW] 解码后帧的排序缓冲区，解决B帧导致的解码顺序与显示顺序不一致问题
+    # 格式: [(pts, frame_object), ...]
+    decoded_frame_buffer = []
+
     source_resolution = (video_stream.width, video_stream.height)
-    BASE_BITRATE = 1500 * 1024  # 可根据需要调整基础码率
+    BASE_BITRATE = 1500 * 1024
     print(f"[服务端-视频] 文件源分辨率: {source_resolution}, 基础码率: {BASE_BITRATE / 1024} kbps")
 
     codec = av.codec.Codec(VIDEO_CODEC, 'w')
@@ -305,113 +308,119 @@ def stream_from_file(video_sock, audio_sock, controller, stream_control, client_
     audio_buffer = b''
     chunk_byte_size = AUDIO_CHUNK * 2 * AUDIO_CHANNELS
 
-    # [MODIFIED] 引入更精确的帧率控制变量
     start_time_perf = time.perf_counter()
-    start_pts_sec = 0.0  # 记录流的起始PTS（以秒为单位）
+    start_pts_sec = 0.0
+    first_frame_processed = False
 
-    # 获取流的第一个包，以确定初始的PTS
-    try:
-        initial_packet = next(container.demux(video_stream, audio_stream))
-        start_pts_sec = float(initial_packet.pts * initial_packet.time_base)
-        packets_to_process = [initial_packet]
-    except StopIteration:
-        packets_to_process = [] # 文件为空
+    demuxer = container.demux(video_stream, audio_stream)
 
     while stream_control.get('running'):
+        # --- Seek Logic ---
         if stream_control['seek_to'] >= 0:
             target_sec = stream_control['seek_to']
             stream_control['seek_to'] = -1.0
             try:
-                # Seek单位是AVStream.time_base，而不是秒或微秒
-                # any_frame=False 确保seek到关键帧，但可能不精确
-                # backward=True 确保我们seek到目标时间点或之前最近的关键帧
                 container.seek(int(target_sec / video_stream.time_base), backward=True, stream=video_stream)
-
-                # [MODIFIED] 精确重置时间戳和性能计数器
-                # 获取seek后第一帧的PTS作为新的起点
-                first_packet_after_seek = next(container.demux(video_stream))
-                start_pts_sec = float(first_packet_after_seek.pts * first_packet_after_seek.time_base)
-                start_time_perf = time.perf_counter()
-
-                print(f"[服务端-推流] 跳转成功到 {start_pts_sec:.2f}s")
+                print(f"[服务端-推流] 跳转到 ~{target_sec:.2f}s")
+                # 清空所有缓冲区和状态
+                decoded_frame_buffer.clear()
                 audio_buffer = b''
                 last_strategy = {}
                 encoder = None
-
-                # 将刚才用于定位的包放入待处理列表
-                packets_to_process = [first_packet_after_seek]
+                first_frame_processed = False
+                demuxer = container.demux(video_stream, audio_stream) # 重置demuxer
             except (StopIteration, av.AVError) as e:
-                print(f"[服务端-推流] 跳转失败或到达文件末尾: {e}")
-                packets_to_process = []
+                print(f"[服务端-推流] 跳转失败: {e}")
 
-        # 如果没有待处理的包（例如，来自seek操作），则从容器中获取下一个
-        if not packets_to_process:
+        # --- Frame Buffering Logic ---
+        # 当缓冲区中的帧数较少时，持续解码并填充缓冲区
+        # 缓冲一定数量的帧（例如，1秒的量）以确保有足够的帧进行排序
+        while len(decoded_frame_buffer) < video_stream.average_rate * 1 and stream_control.get('running'):
             try:
-                packets_to_process = [next(container.demux(video_stream, audio_stream))]
+                packet = next(demuxer)
+                if packet.dts is None: continue
+
+                # 解码packet得到一个或多个frame
+                for frame in packet.decode():
+                    current_pts_sec = float(frame.pts * frame.time_base)
+                    # 将解码后的帧（视频或音频）连同其PTS存入缓冲区
+                    decoded_frame_buffer.append((current_pts_sec, frame))
+
             except StopIteration:
-                print("[服务端-推流] 文件播放结束。"); break
+                # 文件读取完毕，跳出填充循环
+                break
 
-        # [MODIFIED] 统一处理数据包
-        for packet in packets_to_process:
-            if packet.dts is None: continue
+        # 如果填充后缓冲区依然为空（意味着文件已播放完毕），则结束推流
+        if not decoded_frame_buffer:
+            print("[服务端-推流] 文件播放结束。")
+            break
 
-            # [MODIFIED] 基于高精度性能计数器进行帧率控制
-            current_pts_sec = float(packet.pts * packet.time_base)
+        # --- Frame Processing Logic ---
+        # 对缓冲区中的所有帧按PTS（显示时间戳）进行排序
+        decoded_frame_buffer.sort(key=lambda x: x[0])
 
-            # 计算从流开始（或上次seek开始）到现在，视频应该播放到的时间点
-            target_elapsed_time = current_pts_sec - start_pts_sec
+        # 从缓冲区头部取出一个帧进行处理
+        current_pts_sec, frame = decoded_frame_buffer.pop(0)
 
-            # 获取真实流逝的时间
-            real_elapsed_time = time.perf_counter() - start_time_perf
+        # 设置计时器起点
+        if not first_frame_processed:
+            start_pts_sec = current_pts_sec
+            start_time_perf = time.perf_counter()
+            first_frame_processed = True
 
-            # 计算需要等待的时间
-            wait_time = target_elapsed_time - real_elapsed_time
+        # 精确计时和发送
+        target_elapsed_time = current_pts_sec - start_pts_sec
+        real_elapsed_time = time.perf_counter() - start_time_perf
+        wait_time = target_elapsed_time - real_elapsed_time
+        if wait_time > 0:
+            time.sleep(wait_time)
 
-            if wait_time > 0:
-                time.sleep(wait_time)
+        ts_ms = int(current_pts_sec * 1000)
 
-            ts_ms = int(current_pts_sec * 1000)
+        # --- Process Video Frame ---
+        if isinstance(frame, av.VideoFrame):
+            strategy = controller.get_current_strategy()
+            if strategy != last_strategy:
+                # ... (编码器创建逻辑不变) ...
+                print(f"[服务端-编码器] 应用新策略: {strategy}")
+                encoder = av.codec.context.CodecContext.create(VIDEO_CODEC, 'w')
+                encoder.width, encoder.height = source_resolution
+                encoder.bit_rate = int(BASE_BITRATE * strategy['multiplier'])
+                encoder.framerate = video_stream.average_rate
+                encoder.pix_fmt = 'yuv420p'
+                encoder.options = {'preset': 'ultrafast', 'tune': 'zerolatency', 'bframes': '0'}
+                encoder.open(codec)
+                last_strategy = strategy
 
-            # 解码和处理帧
-            for frame in packet.decode():
-                if not stream_control.get('running'): break
+            if not encoder: continue
 
-                if isinstance(frame, av.VideoFrame):
-                    strategy = controller.get_current_strategy()
-                    if strategy != last_strategy:
-                        print(f"[服务端-编码器] 应用新策略: {strategy}")
-                        encoder = av.codec.context.CodecContext.create(VIDEO_CODEC, 'w')
-                        encoder.width, encoder.height = source_resolution
-                        encoder.bit_rate = int(BASE_BITRATE * strategy['multiplier'])
-                        encoder.framerate = video_stream.average_rate
-                        encoder.pix_fmt = 'yuv420p'
-                        encoder.options = {'preset': 'ultrafast', 'tune': 'zerolatency', 'bframes': '0'}
-                        encoder.open(codec)
-                        last_strategy = strategy
+            # 高效、可靠地“净化”帧
+            ndarray_yuv = frame.to_ndarray(format='yuv420p')
+            clean_frame = av.VideoFrame.from_ndarray(ndarray_yuv, format='yuv420p')
+            clean_frame.pts = ts_ms
 
-                    if not encoder: continue
+            for enc_packet in encoder.encode(clean_frame):
+                num_sent = send_packet_fragmented(video_sock, (client_addr[0], VIDEO_PORT), video_seq, ts_ms, enc_packet)
+                video_seq = (video_seq + num_sent) % (2 ** 16)
 
-                    # 高效、可靠地“净化”帧，移除B帧历史
-                    ndarray_yuv = frame.to_ndarray(format='yuv420p')
-                    clean_frame = av.VideoFrame.from_ndarray(ndarray_yuv, format='yuv420p')
-                    clean_frame.pts = ts_ms
+        # --- Process Audio Frame ---
+        elif isinstance(frame, av.AudioFrame) and resampler:
+            for resampled_frame in resampler.resample(frame):
+                audio_buffer += resampled_frame.to_ndarray().tobytes()
+            while len(audio_buffer) >= chunk_byte_size:
+                chunk = audio_buffer[:chunk_byte_size]
+                audio_buffer = audio_buffer[chunk_byte_size:]
+                header = audio_seq.to_bytes(4, 'big') + ts_ms.to_bytes(4, 'big', signed=True)
+                audio_sock.sendto(header + chunk, (client_addr[0], AUDIO_PORT))
+                audio_seq = (audio_seq + 1) % (2 ** 32)
 
-                    for enc_packet in encoder.encode(clean_frame):
-                        num_sent = send_packet_fragmented(video_sock, (client_addr[0], VIDEO_PORT), video_seq, ts_ms, enc_packet)
-                        video_seq = (video_seq + num_sent) % (2 ** 16)
-
-                elif isinstance(frame, av.AudioFrame) and resampler:
-                    for resampled_frame in resampler.resample(frame):
-                        audio_buffer += resampled_frame.to_ndarray().tobytes()
-                    while len(audio_buffer) >= chunk_byte_size:
-                        chunk = audio_buffer[:chunk_byte_size]
-                        audio_buffer = audio_buffer[chunk_byte_size:]
-                        header = audio_seq.to_bytes(4, 'big') + ts_ms.to_bytes(4, 'big', signed=True)
-                        audio_sock.sendto(header + chunk, (client_addr[0], AUDIO_PORT))
-                        audio_seq = (audio_seq + 1) % (2 ** 32)
-
-        # 清空待处理包列表，准备下一次循环
-        packets_to_process = []
+    # 冲洗编码器，发送剩余的帧
+    if encoder:
+        for packet in encoder.flush():
+            # 这里需要一个ts，可以用最后一个已知ts
+            last_ts_ms = int(current_pts_sec * 1000) if 'current_pts_sec' in locals() else 0
+            num_sent = send_packet_fragmented(video_sock, (client_addr[0], VIDEO_PORT), video_seq, last_ts_ms, packet)
+            video_seq = (video_seq + num_sent) % (2 ** 16)
 
     container.close()
     print(f"[服务端-推流] 文件 {video_path} 推流结束。")

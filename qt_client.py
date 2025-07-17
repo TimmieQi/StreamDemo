@@ -129,7 +129,7 @@ class NetworkMonitor:
 # --- 视频Jitter Buffer ---
 class VideoPacketJitterBuffer:
     def __init__(self):
-        self.max_size = 200
+        self.max_size = 300
         self.reset()
 
     def reset(self):
@@ -200,14 +200,14 @@ class DecodedFrameBuffer:
 
 # --- 音频Jitter Buffer ---
 class AudioJitterBuffer:
-    def __init__(self):
-        self.max_size = 200
+    def __init__(self, max_size=200):
+        self.max_size = max_size
         self.silence = b'\x00' * (AUDIO_CHUNK * 2 * AUDIO_CHANNELS)
         self.reset()
 
     def reset(self):
-        self.lock = threading.Lock();
-        self.buffer = [];
+        self.lock = threading.Lock()
+        self.buffer = []
         self.expected_seq = -1
 
     def add_chunk(self, chunk):
@@ -216,25 +216,38 @@ class AudioJitterBuffer:
         ts = int.from_bytes(chunk[4:8], 'big', signed=True)
         payload = chunk[8:]
         with self.lock:
-            if self.expected_seq == -1: self.expected_seq = seq
+            # 只有当第一次添加或者序列号是预期的，才重置expected_seq
+            if self.expected_seq == -1:
+                self.expected_seq = seq
+
+            # 只添加在预期范围内的包，防止缓冲区被过时的包填满
+            # 允许一定的乱序容忍度，例如最多容忍比预期晚到100个包
             if seq >= self.expected_seq and len(self.buffer) < self.max_size:
                 heapq.heappush(self.buffer, (seq, ts, payload))
 
     def get_chunk(self):
         with self.lock:
-            if not self.buffer: return None, None
+            # 如果缓冲区为空，直接返回空，让播放线程等待
+            if not self.buffer:
+                return None, None
+
             seq, ts, payload = self.buffer[0]
+
             if seq == self.expected_seq:
-                heapq.heappop(self.buffer);
+                # 序列号匹配，正常出队
+                heapq.heappop(self.buffer)
                 self.expected_seq += 1
                 return ts, payload
             elif seq < self.expected_seq:
-                heapq.heappop(self.buffer);
-                return self.get_chunk()
-            else:
-                seq, payload = heapq.heappop(self.buffer)
-                self.expected_seq += 1;
-                return None, self.silence  # Keep ts as None if packet is dropped
+                # 收到过时的包，直接丢弃并尝试获取下一个
+                heapq.heappop(self.buffer)
+                return self.get_chunk() # 递归获取
+            else: # seq > self.expected_seq，意味着发生了丢包
+                # 我们不从缓冲区拿走数据，因为那个是未来的包。
+                # 我们返回一个静音块来填补丢失的包，并推进期望的序列号。
+                # 这模拟了播放一个丢失的包。
+                self.expected_seq += 1
+                return None, self.silence # ts为None，payload为静音
 
     def clear(self):
         self.reset()
